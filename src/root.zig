@@ -11,31 +11,11 @@ const Regex = union(enum) {
     const RE = *const @This();
 
     _literal: []const u8,
-    _zero_or_one: RE,
 
-    _zero_or_more: struct {
-        re: RE,
-        greedy: bool,
-    },
-    _one_or_more: struct {
-        re: RE,
-        greedy: bool,
-    },
-
-    _times: struct {
-        re: RE,
-        count: usize,
-        greedy: bool,
-    },
-    _at_least: struct {
-        re: RE,
-        count: usize,
-        greedy: bool,
-    },
-    _around: struct {
+    _repetition: struct {
         re: RE,
         min: usize,
-        max: usize,
+        max: ?usize = null,
         greedy: bool,
     },
 
@@ -43,7 +23,8 @@ const Regex = union(enum) {
 
     _backref: usize,
 
-    word_boundary: void,
+    boundary: void,
+    word: void,
     digits: void,
     alphabet: void,
     alphanumeric: void,
@@ -97,16 +78,16 @@ const Regex = union(enum) {
         defer state.captures.shrinkRetainingCapacity(size);
 
         const re = args[0];
+        const rest_args = args[1..];
+
         var iterator: Iterator = .init(re, input, state);
         defer iterator.deinit(allocator);
 
         while (try iterator.next(allocator)) |m| {
-            const input_ = input[m.pos + m.len ..];
-            const args_ = args[1..];
+            const rest_input = input[m.pos + m.len ..];
+            if (rest_args.len == 0) return m;
 
-            if (args_.len == 0) return m;
-
-            if (try handle_concat(allocator, input_, state, args_)) |m2| {
+            if (try handle_concat(allocator, rest_input, state, rest_args)) |m2| {
                 return .{
                     .pos = m.pos,
                     .len = m.len + m2.len,
@@ -200,6 +181,11 @@ const Regex = union(enum) {
 
     fn match(self: @This(), allocator: Allocator, input: []const u8, state: *SearchState) Allocator.Error!?Match {
         return switch (self) {
+            .any => {
+                if (input.len == 0)
+                    return null;
+                return .{ .pos = 0, .len = 1 };
+            },
             ._literal => |val| {
                 if (val.len == 0 or input.len == 0)
                     return null;
@@ -234,18 +220,14 @@ const Regex = union(enum) {
                 return result;
             },
 
-            ._zero_or_more,
-            ._one_or_more,
-            ._zero_or_one,
-            ._times,
-            ._at_least,
-            ._around,
-            => return handle_concat(allocator, input, state, &.{&self}),
+            ._repetition => return handle_concat(allocator, input, state, &.{&self}),
 
             ._concat => |args| return handle_concat(allocator, input, state, args),
 
-            // TODO:
-            else => return null,
+            else => {
+                std.debug.print("TODO: {s}\n", .{@tagName(self)});
+                unreachable;
+            },
         };
     }
 
@@ -270,13 +252,109 @@ const Regex = union(enum) {
         return .{ ._literal = value };
     }
 
-    fn zero_or_more(re: RE) Self {
+    fn zeroOrOne(re: RE) Self {
         return .{
-            ._zero_or_more = .{
+            ._zero_or_one = .{
                 .re = re,
-                .greedy = true,
+                .greedy = false,
             },
         };
+    }
+
+    fn zeroOrMore(re: RE) Self {
+        return .{
+            ._repetition = .{
+                .re = re,
+                .greedy = false,
+                .min = 0,
+            },
+        };
+    }
+
+    fn zeroOrMoreAll(re: RE) Self {
+        return .{
+            ._repetition = .{
+                .re = re,
+                .greedy = true,
+                .min = 0,
+            },
+        };
+    }
+
+    fn oneOrMore(re: RE) Self {
+        return .{
+            ._repetition = .{
+                .re = re,
+                .greedy = false,
+                .min = 1,
+            },
+        };
+    }
+
+    fn oneOrMoreAll(re: RE) Self {
+        return .{
+            ._repetition = .{
+                .re = re,
+                .greedy = true,
+                .min = 1,
+            },
+        };
+    }
+
+    fn atLeast(count: usize, re: RE) Self {
+        return .{
+            ._repetition = .{
+                .re = re,
+                .greedy = true,
+                .min = count,
+            },
+        };
+    }
+
+    fn atMost(count: usize, re: RE) Self {
+        return .{
+            ._repetition = .{
+                .re = re,
+                .greedy = true,
+                .min = 0,
+                .max = count,
+            },
+        };
+    }
+
+    fn around(min: usize, max: usize, re: RE) Self {
+        return .{
+            ._repetition = .{
+                .re = re,
+                .greedy = true,
+                .min = min,
+                .max = max,
+            },
+        };
+    }
+
+    fn times(count: usize, re: RE) Self {
+        return .{
+            ._repetition = .{
+                .re = re,
+                .greedy = true,
+                .min = count,
+                .max = count,
+            },
+        };
+    }
+
+    inline fn @"*"(re: RE) Self {
+        return zeroOrMoreAll(re);
+    }
+    inline fn @"+"(re: RE) Self {
+        return oneOrMoreAll(re);
+    }
+    inline fn @"*?"(re: RE) Self {
+        return zeroOrMore(re);
+    }
+    inline fn @"+?"(re: RE) Self {
+        return oneOrMore(re);
     }
 
     fn backref(index: usize) Self {
@@ -296,7 +374,6 @@ const Regex = union(enum) {
     }
 };
 
-// TODO: test
 const LazyIterator = struct {
     re: Regex.RE,
     state: *Regex.SearchState,
@@ -331,6 +408,7 @@ const LazyIterator = struct {
         if (self.first) {
             self.first = false;
 
+            // skip first few matches until min
             while (self.iterations < self.min) {
                 if (try self.re.match(allocator, input[self.pos..], state)) |m| {
                     self.pos = m.pos;
@@ -345,12 +423,19 @@ const LazyIterator = struct {
         const max = self.max orelse std.math.maxInt(usize);
 
         if (self.iterations <= max) {
-            if (try self.re.match(allocator, input[self.pos..], state)) |m| {
-                self.pos = m.pos;
-                self.len = m.len;
+            if (try self.re.match(allocator, input[self.pos + self.len ..], state)) |m| {
+                self.len += m.len;
                 self.iterations += 1;
                 return self.current();
             }
+        }
+
+        // match zero string
+        if (self.iterations <= max + 1) {
+            self.iterations += 1;
+            self.pos = 0;
+            self.pos = 0;
+            return self.current();
         }
 
         return null;
@@ -377,6 +462,7 @@ const GreedyIterator = struct {
         self.lengths.deinit(allocator);
     }
 
+    // TODO: remove current and value
     fn value(self: Self) []const u8 {
         const i = self.pos;
         return self.input[i .. i + self.len];
@@ -395,6 +481,7 @@ const GreedyIterator = struct {
             var n: usize = 0;
             var input = self.input;
 
+            // skip first few matches until min
             while (n < self.min) {
                 if (try self.re.match(allocator, input[self.pos..], state)) |m| {
                     self.pos = m.pos;
@@ -495,80 +582,25 @@ const Iterator = union(enum) {
         state: *Regex.SearchState,
     ) Self {
         return switch (re.*) {
-            else => .{ .single = .{
-                .re = re,
-                .state = state,
-                .input = input,
-            } },
-            ._zero_or_more => |val| createRepetition(.{
-                .greedy = val.greedy,
-                .re = val.re,
-                .state = state,
-                .input = input,
-                .min = 0,
-            }),
-            ._one_or_more => |val| createRepetition(.{
-                .greedy = val.greedy,
-                .re = val.re,
-                .state = state,
-                .input = input,
-                .min = 1,
-            }),
-            ._zero_or_one => |val| createRepetition(.{
-                .greedy = false,
-                .re = val,
-                .state = state,
-                .input = input,
-                .min = 0,
-                .max = 1,
-            }),
-            ._times => |val| createRepetition(.{
-                .greedy = val.greedy,
-                .re = val.re,
-                .state = state,
-                .input = input,
-                .min = val.count,
-                .max = val.count,
-            }),
-            ._at_least => |val| createRepetition(.{
-                .greedy = val.greedy,
-                .re = val.re,
-                .state = state,
-                .input = input,
-                .min = val.count,
-            }),
-            ._around => |val| createRepetition(.{
-                .greedy = val.greedy,
+            ._repetition => |val| if (val.greedy) .{ .greedy = GreedyIterator{
                 .re = val.re,
                 .state = state,
                 .input = input,
                 .min = val.min,
                 .max = val.max,
-            }),
+            } } else .{ .lazy = LazyIterator{
+                .re = val.re,
+                .state = state,
+                .input = input,
+                .min = val.min,
+                .max = val.max,
+            } },
+            else => .{ .single = .{
+                .re = re,
+                .state = state,
+                .input = input,
+            } },
         };
-    }
-
-    fn createRepetition(args: struct {
-        greedy: bool,
-        re: Regex.RE,
-        state: *Regex.SearchState,
-        input: []const u8,
-        min: usize,
-        max: ?usize = null,
-    }) Self {
-        return if (args.greedy) .{ .greedy = GreedyIterator{
-            .re = args.re,
-            .state = args.state,
-            .input = args.input,
-            .min = args.min,
-            .max = args.max,
-        } } else .{ .lazy = LazyIterator{
-            .re = args.re,
-            .state = args.state,
-            .input = args.input,
-            .min = args.min,
-            .max = args.max,
-        } };
     }
 
     fn deinit(self: *Iterator, allocator: Allocator) void {
@@ -654,18 +686,18 @@ test {
             .expected = "aa",
         },
         .{
-            .re = &.zero_or_more(&.literal("a")),
+            .re = &.zeroOrMoreAll(&.literal("a")),
             .input = "qwersdfz",
             .expected = "",
         },
         .{
-            .re = &.zero_or_more(&.literal("a")),
+            .re = &.zeroOrMoreAll(&.literal("a")),
             .input = "aaaqwersdfz",
             .expected = "aaa",
         },
         .{
             .re = &.concat(&.{
-                &.zero_or_more(&.literal("a")),
+                &.zeroOrMoreAll(&.literal("a")),
                 &.literal("a"),
             }),
             .input = "aaabbbcca",
@@ -673,18 +705,56 @@ test {
         },
         .{
             .re = &.concat(&.{
-                &.zero_or_more(&.literal("a")),
-                &.zero_or_more(&.literal("a")),
+                &.zeroOrMoreAll(&.literal("a")),
+                &.zeroOrMoreAll(&.literal("a")),
                 &.literal("aa"),
                 &.literal("b"),
-                &.zero_or_more(&.literal("c")),
+                &.zeroOrMoreAll(&.literal("c")),
             }),
             .input = "aaaaab",
             .expected = "aaaaab",
         },
         .{
             .re = &.concat(&.{
-                &.zero_or_more(&.literal("a")),
+                &.literal("a"),
+                &.zeroOrMoreAll(&.any),
+                &.literal("x"),
+            }),
+            .input = "abcdxefghxij",
+            .expected = "abcdxefghx",
+        },
+
+        .{
+            .re = &.concat(&.{
+                &.literal("a"),
+                &.@"*?"(&.any),
+                &.literal("x"),
+            }),
+            .input = "abcdxefghxij",
+            .expected = "abcdx",
+        },
+        .{
+            .re = &.concat(&.{
+                &.literal("a"),
+                &.zeroOrMore(&.any),
+                &.literal("x"),
+            }),
+            .input = "axefghxij",
+            .expected = "ax",
+        },
+        .{
+            .re = &.concat(&.{
+                &.literal("a"),
+                &.zeroOrMoreAll(&.any),
+                &.literal("x"),
+            }),
+            .input = "axefghij",
+            .expected = "ax",
+        },
+
+        .{
+            .re = &.concat(&.{
+                &.zeroOrMoreAll(&.literal("a")),
                 &.literal("bc"),
             }),
             .input = "aabbaabaabcca",
@@ -692,7 +762,7 @@ test {
         },
         .{
             .re = &.concat(&.{
-                &.capture(&.zero_or_more(&.literal("a"))),
+                &.capture(&.zeroOrMoreAll(&.literal("a"))),
                 &.capture(&.literal("bb")),
                 &.backref(0),
                 &.backref(1),
