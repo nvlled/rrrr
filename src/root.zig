@@ -104,7 +104,7 @@ const Regex = union(enum) {
             },
             ._backref => |index| {
                 const size = state.captures.items.len;
-                defer state.captures.shrinkAndFree(allocator, size);
+                defer state.captures.shrinkRetainingCapacity(size);
 
                 if (index >= 0 and index < state.captures.items.len) {
                     const val = state.captures.items[index];
@@ -132,7 +132,7 @@ const Regex = union(enum) {
 
             ._concat => |args| {
                 const size = state.captures.items.len;
-                defer state.captures.shrinkAndFree(allocator, size);
+                defer state.captures.shrinkRetainingCapacity(size);
 
                 if (args.len == 0) return null;
 
@@ -159,105 +159,48 @@ const Regex = union(enum) {
                         else => .{ args[i], false },
                     };
 
-                    var str = input[result.pos + result.len ..];
-                    var iterator: ?Iterator = undefined;
-
-                    if (step_back) {
-                        const s = snapshot.pop() orelse break;
-                        const capture_size = s.capture_size;
-                        result = s.match;
-                        iterator = s.iterator;
-                        i = s.arg_index;
-                        state.captures.shrinkAndFree(allocator, capture_size);
-                        str = input[result.pos + result.len ..];
-                        step_back = false;
-                    } else {
-                        // TODO: I may need to do recusively traverse the list
-                        // pairwise, foo(re1, foo(..))
-                        // that way I don't have to wrap concat above
-                        // and no need to handle capture and repetitions separately
-                        iterator = switch (re.*) {
-                            ._zero_or_more => |val| .init(val.greedy, .{
-                                .re = val.re,
-                                .state = state,
-                                .input = str,
-                                .min = 0,
-                            }),
-                            ._one_or_more => |val| .init(val.greedy, .{
-                                .re = val.re,
-                                .input = str,
-                                .state = state,
-                                .min = 1,
-                            }),
-                            ._zero_or_one => |val| .init(false, .{
-                                .re = val,
-                                .state = state,
-                                .input = str,
-                                .min = 0,
-                                .max = 1,
-                            }),
-                            ._times => |val| .init(val.greedy, .{
-                                .re = val.re,
-                                .state = state,
-                                .input = str,
-                                .min = val.count,
-                                .max = val.count,
-                            }),
-                            ._at_least => |val| .init(val.greedy, .{
-                                .re = val.re,
-                                .state = state,
-                                .input = str,
-                                .min = val.count,
-                            }),
-                            ._around => |val| .init(val.greedy, .{
-                                .re = val.re,
-                                .state = state,
-                                .input = str,
-                                .min = val.min,
-                                .max = val.max,
-                            }),
-                            else => null,
-                        };
-                    }
-
-                    const m = blk: switch (iterator != null) {
+                    var iterator, const str = blk: switch (step_back) {
                         true => {
-                            const iter = &iterator.?;
-                            errdefer iter.deinit(allocator);
-                            if (try iter.next(allocator)) |m| {
-                                try snapshot.append(allocator, .{
-                                    .match = result,
-                                    .iterator = iter.*,
-                                    .arg_index = i,
-                                    .capture_size = state.captures.items.len,
-                                });
-                                break :blk m;
-                            } else {
-                                iter.deinit(allocator);
-                                step_back = true;
-                                continue;
-                            }
+                            const s = snapshot.pop() orelse break;
+                            const capture_size = s.capture_size;
+                            state.captures.shrinkRetainingCapacity(capture_size);
+
+                            i = s.arg_index;
+                            result = s.match;
+                            step_back = false;
+
+                            const str = input[result.pos + result.len ..];
+                            break :blk .{ s.iterator, str };
                         },
                         false => {
-                            const m = try re.match(allocator, str, state) orelse {
-                                step_back = true;
-                                continue;
-                            };
-                            break :blk m;
+                            const str = input[result.pos + result.len ..];
+                            const iterator: Iterator = .init(re, str, state);
+                            break :blk .{ iterator, str };
                         },
                     };
+                    errdefer iterator.deinit(allocator);
 
-                    if (i == 0) result.pos = m.pos;
+                    const m = try iterator.next(allocator) orelse {
+                        iterator.deinit(allocator);
+                        step_back = true;
+                        continue;
+                    };
+
+                    switch (iterator) {
+                        .single => {},
+                        else => try snapshot.append(allocator, .{
+                            .match = result,
+                            .iterator = iterator,
+                            .arg_index = i,
+                            .capture_size = state.captures.items.len,
+                        }),
+                    }
+
                     result.len += m.len;
+                    if (i == 0) result.pos = m.pos;
+                    if (i >= args.len - 1) return result;
+                    if (capture_result) try state.captures.append(allocator, m.value(str));
                     i += 1;
-
-                    if (capture_result) {
-                        try state.captures.append(allocator, m.value(str));
-                    }
-
-                    if (i >= args.len) {
-                        return result;
-                    }
                 }
 
                 return null;
@@ -466,35 +409,125 @@ const GreedyIterator = struct {
     }
 };
 
-const Iterator = union(enum) {
-    greedy: GreedyIterator,
-    lazy: LazyIterator,
+const SingleIterator = struct {
+    re: Regex.RE,
+    state: *Regex.SearchState,
+    input: []const u8,
+    pos: usize = 0,
+    len: usize = 0,
+    first: bool = true,
 
     const Self = @This();
 
-    fn init(greedy: bool, args: struct {
+    fn deinit(_: *Self, _: Allocator) void {}
+
+    fn value(self: Self) []const u8 {
+        const i = self.pos;
+        return self.input[i .. i + self.len];
+    }
+
+    fn current(self: Self) Regex.Match {
+        return .{ .pos = self.pos, .len = self.len };
+    }
+
+    fn next(self: *Self, allocator: Allocator) !?Regex.Match {
+        if (self.first) {
+            self.first = false;
+            const result = try self.re.match(allocator, self.input, self.state);
+            if (result) |m| {
+                self.pos = m.pos;
+                self.len = m.len;
+            }
+            return result;
+        }
+        return null;
+    }
+};
+
+const Iterator = union(enum) {
+    greedy: GreedyIterator,
+    lazy: LazyIterator,
+    single: SingleIterator,
+
+    const Self = @This();
+
+    fn init(
+        re: Regex.RE,
+        input: []const u8,
+        state: *Regex.SearchState,
+    ) Self {
+        return switch (re.*) {
+            else => .{ .single = .{
+                .re = re,
+                .state = state,
+                .input = input,
+            } },
+            ._zero_or_more => |val| createRepetition(.{
+                .greedy = val.greedy,
+                .re = val.re,
+                .state = state,
+                .input = input,
+                .min = 0,
+            }),
+            ._one_or_more => |val| createRepetition(.{
+                .greedy = val.greedy,
+                .re = val.re,
+                .state = state,
+                .input = input,
+                .min = 1,
+            }),
+            ._zero_or_one => |val| createRepetition(.{
+                .greedy = false,
+                .re = val,
+                .state = state,
+                .input = input,
+                .min = 0,
+                .max = 1,
+            }),
+            ._times => |val| createRepetition(.{
+                .greedy = val.greedy,
+                .re = val.re,
+                .state = state,
+                .input = input,
+                .min = val.count,
+                .max = val.count,
+            }),
+            ._at_least => |val| createRepetition(.{
+                .greedy = val.greedy,
+                .re = val.re,
+                .state = state,
+                .input = input,
+                .min = val.count,
+            }),
+            ._around => |val| createRepetition(.{
+                .greedy = val.greedy,
+                .re = val.re,
+                .state = state,
+                .input = input,
+                .min = val.min,
+                .max = val.max,
+            }),
+        };
+    }
+
+    fn createRepetition(args: struct {
+        greedy: bool,
         re: Regex.RE,
         state: *Regex.SearchState,
         input: []const u8,
-        pos: usize = 0,
-        len: usize = 0,
         min: usize,
         max: ?usize = null,
     }) Self {
-        return if (greedy) .{ .greedy = GreedyIterator{
+        return if (args.greedy) .{ .greedy = GreedyIterator{
             .re = args.re,
             .state = args.state,
             .input = args.input,
-            .pos = args.pos,
-            .len = args.len,
             .min = args.min,
             .max = args.max,
         } } else .{ .lazy = LazyIterator{
             .re = args.re,
             .state = args.state,
             .input = args.input,
-            .pos = args.pos,
-            .len = args.len,
             .min = args.min,
             .max = args.max,
         } };
@@ -504,6 +537,7 @@ const Iterator = union(enum) {
         return switch (self.*) {
             .greedy => |*iter| iter.deinit(allocator),
             .lazy => |*iter| iter.deinit(allocator),
+            .single => |*iter| iter.deinit(allocator),
         };
     }
 
@@ -511,6 +545,7 @@ const Iterator = union(enum) {
         return switch (self) {
             .greedy => |*iter| iter.value(),
             .lazy => |*iter| iter.value(),
+            .single => |*iter| iter.value(),
         };
     }
 
@@ -518,6 +553,7 @@ const Iterator = union(enum) {
         return switch (self.*) {
             .greedy => |*iter| try iter.next(allocator),
             .lazy => |*iter| try iter.next(allocator),
+            .single => |*iter| try iter.next(allocator),
         };
     }
 };
@@ -629,8 +665,8 @@ test {
     };
 
     for (tests) |item| {
-        std.debug.print("input: {s}, expected: {s}, got: ", .{ item.input, item.expected orelse "<null>" });
         const result = try item.re.search(std.testing.allocator, item.input);
+        std.debug.print("input: {s}, expected: {s}, got: ", .{ item.input, item.expected orelse "<null>" });
         if (result) |m| {
             std.debug.print("{s}\n", .{m.value(item.input)});
         } else {
