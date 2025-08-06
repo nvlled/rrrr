@@ -389,18 +389,6 @@ const LazyIterator = struct {
 
     fn deinit(_: *Self, _: Allocator) void {}
 
-    fn value(self: Self) []const u8 {
-        const i = self.pos;
-        return self.input[i .. i + self.len];
-    }
-
-    fn current(self: Self) Regex.Match {
-        return .{
-            .pos = self.pos,
-            .len = self.len,
-        };
-    }
-
     fn next(self: *Self, allocator: Allocator) !?Regex.Match {
         const state = self.state;
         var input = self.input;
@@ -417,7 +405,7 @@ const LazyIterator = struct {
                 } else return null;
             }
 
-            return self.current();
+            return .{ .pos = self.pos, .len = self.len };
         }
 
         const max = self.max orelse std.math.maxInt(usize);
@@ -426,7 +414,7 @@ const LazyIterator = struct {
             if (try self.re.match(allocator, input[self.pos + self.len ..], state)) |m| {
                 self.len += m.len;
                 self.iterations += 1;
-                return self.current();
+                return .{ .pos = self.pos, .len = self.len };
             }
         }
 
@@ -435,7 +423,7 @@ const LazyIterator = struct {
             self.iterations += 1;
             self.pos = 0;
             self.pos = 0;
-            return self.current();
+            return .{ .pos = self.pos, .len = self.len };
         }
 
         return null;
@@ -451,25 +439,12 @@ const GreedyIterator = struct {
     min: usize,
     max: ?usize = null,
     first: bool = true,
-
-    // TODO: store only the len since the substrings
-    // are sequential and no gaps in between
-    lengths: std.ArrayListUnmanaged(Regex.Match) = .{},
+    lengths: std.ArrayListUnmanaged(usize) = .{},
 
     const Self = @This();
 
     fn deinit(self: *Self, allocator: Allocator) void {
         self.lengths.deinit(allocator);
-    }
-
-    // TODO: remove current and value
-    fn value(self: Self) []const u8 {
-        const i = self.pos;
-        return self.input[i .. i + self.len];
-    }
-
-    fn current(self: Self) Regex.Match {
-        return .{ .pos = self.pos, .len = self.len };
     }
 
     fn next(self: *Self, allocator: Allocator) !?Regex.Match {
@@ -494,10 +469,7 @@ const GreedyIterator = struct {
             var i: usize = 0;
 
             if (n == 0) {
-                try self.lengths.append(allocator, .{
-                    .pos = 0,
-                    .len = 0,
-                });
+                try self.lengths.append(allocator, 0);
                 matched = true;
             }
 
@@ -514,20 +486,16 @@ const GreedyIterator = struct {
                     self.len += m.len;
                     i += m.pos + m.len;
 
-                    try self.lengths.append(allocator, .{
-                        .pos = self.pos,
-                        .len = self.len,
-                    });
+                    try self.lengths.append(allocator, self.len);
                 } else break;
             }
 
-            return if (matched) self.current() else null;
+            return if (!matched) null else .{ .pos = self.pos, .len = self.len };
         }
 
-        if (self.lengths.pop()) |m| {
-            self.pos = m.pos;
-            self.len = m.len;
-            return self.current();
+        if (self.lengths.pop()) |len| {
+            self.len = len;
+            return .{ .pos = self.pos, .len = self.len };
         }
 
         return null;
@@ -545,15 +513,6 @@ const SingleIterator = struct {
     const Self = @This();
 
     fn deinit(_: *Self, _: Allocator) void {}
-
-    fn value(self: Self) []const u8 {
-        const i = self.pos;
-        return self.input[i .. i + self.len];
-    }
-
-    fn current(self: Self) Regex.Match {
-        return .{ .pos = self.pos, .len = self.len };
-    }
 
     fn next(self: *Self, allocator: Allocator) !?Regex.Match {
         if (self.first) {
@@ -605,25 +564,13 @@ const Iterator = union(enum) {
 
     fn deinit(self: *Iterator, allocator: Allocator) void {
         return switch (self.*) {
-            .greedy => |*iter| iter.deinit(allocator),
-            .lazy => |*iter| iter.deinit(allocator),
-            .single => |*iter| iter.deinit(allocator),
-        };
-    }
-
-    fn value(self: Iterator) ?[]const u8 {
-        return switch (self) {
-            .greedy => |*iter| iter.value(),
-            .lazy => |*iter| iter.value(),
-            .single => |*iter| iter.value(),
+            inline else => |*iter| iter.deinit(allocator),
         };
     }
 
     fn next(self: *Iterator, allocator: Allocator) !?Regex.Match {
         return switch (self.*) {
-            .greedy => |*iter| try iter.next(allocator),
-            .lazy => |*iter| try iter.next(allocator),
-            .single => |*iter| try iter.next(allocator),
+            inline else => |*iter| try iter.next(allocator),
         };
     }
 };
