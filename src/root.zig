@@ -191,86 +191,68 @@ const Regex = union(enum) {
 
         const match_one: Match = .{ .pos = 0, .len = 1 };
         return switch (self) {
-            .any => return match_one,
+            .any => match_one,
 
-            .word => {
-                return switch (input[0]) {
-                    '0'...'9', 'A'...'Z', 'a'...'z', '_' => match_one,
-                    else => null,
-                };
+            .word => switch (input[0]) {
+                '0'...'9', 'A'...'Z', 'a'...'z', '_' => match_one,
+                else => null,
             },
-            .@"!word" => {
-                return switch (input[0]) {
-                    '0'...'9', 'A'...'Z', 'a'...'z', '_' => null,
-                    else => match_one,
-                };
+            .@"!word" => switch (input[0]) {
+                '0'...'9', 'A'...'Z', 'a'...'z', '_' => null,
+                else => match_one,
             },
 
-            .alphanum => {
-                return switch (input[0]) {
-                    '0'...'9', 'A'...'Z', 'a'...'z' => match_one,
-                    else => null,
-                };
+            .alphanum => switch (input[0]) {
+                '0'...'9', 'A'...'Z', 'a'...'z' => match_one,
+                else => null,
             },
-            .@"!alphanum" => {
-                return switch (input[0]) {
-                    '0'...'9', 'A'...'Z', 'a'...'z' => null,
-                    else => match_one,
-                };
+            .@"!alphanum" => switch (input[0]) {
+                '0'...'9', 'A'...'Z', 'a'...'z' => null,
+                else => match_one,
             },
 
-            .alphabet => {
-                return switch (input[0]) {
-                    'A'...'Z', 'a'...'z' => match_one,
-                    else => null,
-                };
+            .alphabet => switch (input[0]) {
+                'A'...'Z', 'a'...'z' => match_one,
+                else => null,
             },
-            .@"!alphabet" => {
-                return switch (input[0]) {
-                    else => match_one,
-                    'A'...'Z', 'a'...'z' => null,
-                };
+            .@"!alphabet" => switch (input[0]) {
+                else => match_one,
+                'A'...'Z', 'a'...'z' => null,
             },
 
-            .digit => {
-                return switch (input[0]) {
-                    '0'...'9' => match_one,
-                    else => null,
-                };
+            .digit => switch (input[0]) {
+                '0'...'9' => match_one,
+                else => null,
             },
-            .@"!digit" => {
-                return switch (input[0]) {
-                    else => match_one,
-                    '0'...'9' => null,
-                };
+            .@"!digit" => switch (input[0]) {
+                else => match_one,
+                '0'...'9' => null,
             },
 
-            .whitespace => {
-                return switch (input[0]) {
-                    ' ',
-                    '\t',
-                    '\n',
-                    '\r',
-                    0xC, // form feed \f
-                    0xB, // vertical tab \v
-                    0x85, // next line
-                    => .{ .pos = 0, .len = 1 },
-                    else => null,
-                };
+            .whitespace => switch (input[0]) {
+                ' ',
+                '\t',
+                '\n',
+                '\r',
+                0xC, // form feed \f
+                0xB, // vertical tab \v
+                0x85, // next line
+                => match_one,
+                else => null,
             },
             .@"!whitespace" => {
                 const re: Regex = .whitespace;
                 const m = try re.match(allocator, input, state);
-                return if (m == null) .{ .pos = 0, .len = 1 } else null;
+                return if (m == null) match_one else null;
             },
 
             ._literal => |val| {
-                if (val.len == 0)
-                    return null;
                 if (std.mem.eql(u8, val, input[0..@min(val.len, input.len)]))
-                    return .{ .pos = 0, .len = val.len };
-                return null;
+                    return .{ .pos = 0, .len = val.len }
+                else
+                    return null;
             },
+
             ._alt => |args| {
                 for (args) |re| {
                     if (try re.match(allocator, input, state)) |m| {
@@ -279,6 +261,7 @@ const Regex = union(enum) {
                 }
                 return null;
             },
+
             ._backref => |index| {
                 const size = state.captures.items.len;
                 defer state.captures.shrinkRetainingCapacity(size);
@@ -290,6 +273,7 @@ const Regex = union(enum) {
                 }
                 return null;
             },
+
             ._capture => |re| {
                 const result = try re.match(allocator, input, state);
                 if (result) |m| {
@@ -298,9 +282,9 @@ const Regex = union(enum) {
                 return result;
             },
 
-            ._repetition => return handle_concat(allocator, input, state, &.{&self}),
+            ._repetition => handle_concat(allocator, input, state, &.{&self}),
 
-            ._concat => |args| return handle_concat(allocator, input, state, args),
+            ._concat => |args| handle_concat(allocator, input, state, args),
 
             else => {
                 std.debug.print("TODO: {s}\n", .{@tagName(self)});
