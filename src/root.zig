@@ -65,17 +65,55 @@ const Regex = union(enum) {
         captures: std.ArrayListUnmanaged([]const u8),
     };
 
+    const Input = struct {
+        value: []const u8,
+        pos: usize,
+
+        inline fn size(self: @This()) usize {
+            return self.value.len - self.pos;
+        }
+
+        inline fn string(self: @This()) []const u8 {
+            return self.value[self.pos..];
+        }
+
+        fn prev(self: @This()) ?u8 {
+            if (self.pos > 0 and self.value.len > 0)
+                return self.value[self.pos - 1];
+            return null;
+        }
+        fn current(self: @This()) ?u8 {
+            const len = self.value.len;
+            if (self.pos >= 0 and self.pos < len and len > 0)
+                return self.value[self.pos];
+            return null;
+        }
+        fn next(self: @This()) ?u8 {
+            const len = self.value.len;
+            if (self.pos < len - 1 and self.value.len > 0)
+                return self.value[self.pos + 1];
+            return null;
+        }
+
+        fn slice(self: @This(), offset: usize) Input {
+            return .{
+                .value = self.value,
+                .pos = self.pos + offset,
+            };
+        }
+    };
+
     fn search(self: @This(), allocator: Allocator, input: []const u8) Allocator.Error!?Match {
         var state: SearchState = .{
             .captures = .{},
         };
         defer state.captures.deinit(allocator);
-        return self.match(allocator, input, &state);
+        return self.match(allocator, .{ .value = input, .pos = 0 }, &state);
     }
 
     fn handle_concat(
         allocator: Allocator,
-        input: []const u8,
+        input: Input,
         state: *SearchState,
         args: []const RE,
     ) !?Match {
@@ -91,7 +129,7 @@ const Regex = union(enum) {
         defer iterator.deinit(allocator);
 
         while (try iterator.next(allocator)) |m| {
-            const rest_input = input[m.pos + m.len ..];
+            const rest_input = input.slice(m.pos + m.len);
             if (rest_args.len == 0) return m;
 
             if (try handle_concat(allocator, rest_input, state, rest_args)) |m2| {
@@ -186,21 +224,24 @@ const Regex = union(enum) {
         return null;
     }
 
-    fn match(self: @This(), allocator: Allocator, input: []const u8, state: *SearchState) Allocator.Error!?Match {
-        if (input.len == 0) return null;
+    inline fn isWordChar(ch: u8) bool {
+        return switch (ch) {
+            '0'...'9', 'A'...'Z', 'a'...'z', '_' => true,
+            else => false,
+        };
+    }
 
+    fn match(self: @This(), allocator: Allocator, input_arg: Input, state: *SearchState) Allocator.Error!?Match {
+        const input = input_arg.string();
         const match_one: Match = .{ .pos = 0, .len = 1 };
+
+        if (input.len == 0 and self != .boundary) return null;
+
         return switch (self) {
             .any => match_one,
 
-            .word => switch (input[0]) {
-                '0'...'9', 'A'...'Z', 'a'...'z', '_' => match_one,
-                else => null,
-            },
-            .@"!word" => switch (input[0]) {
-                '0'...'9', 'A'...'Z', 'a'...'z', '_' => null,
-                else => match_one,
-            },
+            .word => if (isWordChar(input[0])) match_one else null,
+            .@"!word" => if (!isWordChar(input[0])) match_one else null,
 
             .alphanum => switch (input[0]) {
                 '0'...'9', 'A'...'Z', 'a'...'z' => match_one,
@@ -242,8 +283,20 @@ const Regex = union(enum) {
             },
             .@"!whitespace" => {
                 const re: Regex = .whitespace;
-                const m = try re.match(allocator, input, state);
+                const m = try re.match(allocator, input_arg, state);
                 return if (m == null) match_one else null;
+            },
+
+            .boundary => {
+                const match_zero: Match = .{ .pos = 0, .len = 0 };
+                const prev = input_arg.prev() orelse return match_zero;
+                const next = input_arg.current() orelse return match_zero;
+
+                const matched =
+                    isWordChar(prev) and !isWordChar(next) or
+                    !isWordChar(prev) and isWordChar(next);
+
+                return if (matched) match_zero else null;
             },
 
             ._literal => |val| {
@@ -255,7 +308,7 @@ const Regex = union(enum) {
 
             ._alt => |args| {
                 for (args) |re| {
-                    if (try re.match(allocator, input, state)) |m| {
+                    if (try re.match(allocator, input_arg, state)) |m| {
                         return m;
                     }
                 }
@@ -275,16 +328,16 @@ const Regex = union(enum) {
             },
 
             ._capture => |re| {
-                const result = try re.match(allocator, input, state);
+                const result = try re.match(allocator, input_arg, state);
                 if (result) |m| {
                     try state.captures.append(allocator, m.value(input));
                 }
                 return result;
             },
 
-            ._repetition => handle_concat(allocator, input, state, &.{&self}),
+            ._repetition => handle_concat(allocator, input_arg, state, &.{&self}),
 
-            ._concat => |args| handle_concat(allocator, input, state, args),
+            ._concat => |args| handle_concat(allocator, input_arg, state, args),
 
             else => {
                 std.debug.print("TODO: {s}\n", .{@tagName(self)});
@@ -467,7 +520,7 @@ const Regex = union(enum) {
 const LazyIterator = struct {
     re: Regex.RE,
     state: *Regex.SearchState,
-    input: []const u8,
+    input: Regex.Input,
     pos: usize = 0,
     len: usize = 0,
     iterations: usize = 0,
@@ -488,7 +541,7 @@ const LazyIterator = struct {
 
             // skip first few matches until min
             while (self.iterations < self.min) {
-                if (try self.re.match(allocator, input[self.pos..], state)) |m| {
+                if (try self.re.match(allocator, input.slice(self.pos), state)) |m| {
                     self.pos = m.pos;
                     self.len = m.len;
                     self.iterations += 1;
@@ -501,7 +554,7 @@ const LazyIterator = struct {
         const max = self.max orelse std.math.maxInt(usize);
 
         if (self.iterations <= max) {
-            if (try self.re.match(allocator, input[self.pos + self.len ..], state)) |m| {
+            if (try self.re.match(allocator, input.slice(self.pos + self.len), state)) |m| {
                 self.len += m.len;
                 self.iterations += 1;
                 return .{ .pos = self.pos, .len = self.len };
@@ -523,7 +576,7 @@ const LazyIterator = struct {
 const GreedyIterator = struct {
     re: Regex.RE,
     state: *Regex.SearchState,
-    input: []const u8,
+    input: Regex.Input,
     pos: usize = 0,
     len: usize = 0,
     min: usize,
@@ -549,7 +602,7 @@ const GreedyIterator = struct {
 
             // skip first few matches until min
             while (n < self.min) {
-                if (try self.re.match(allocator, input[self.pos..], state)) |m| {
+                if (try self.re.match(allocator, input.slice(self.pos), state)) |m| {
                     self.pos = m.pos;
                     n += 1;
                 } else return null;
@@ -562,7 +615,7 @@ const GreedyIterator = struct {
                     if (lengths.items.len >= max) break;
                 }
 
-                if (try self.re.match(allocator, input[self.pos + self.len ..], state)) |m| {
+                if (try self.re.match(allocator, input.slice(self.pos + self.len), state)) |m| {
                     self.len += m.len;
                     if (lengths.items.len == 0) self.pos = m.pos;
                     try lengths.append(allocator, self.len);
@@ -582,7 +635,7 @@ const GreedyIterator = struct {
 const SingleIterator = struct {
     re: Regex.RE,
     state: *Regex.SearchState,
-    input: []const u8,
+    input: Regex.Input,
     pos: usize = 0,
     len: usize = 0,
     first: bool = true,
@@ -614,7 +667,7 @@ const Iterator = union(enum) {
 
     fn init(
         re: Regex.RE,
-        input: []const u8,
+        input: Regex.Input,
         state: *Regex.SearchState,
     ) Self {
         return switch (re.*) {
@@ -824,6 +877,28 @@ test {
             }),
             .input = "abcd.1234x-xyz",
             .expected = "abcd.1234x",
+        },
+        .{
+            .re = &.concat(&.{
+                &.boundary,
+                &.literal("ab"),
+                &.boundary,
+                &.literal("-"),
+                &.boundary,
+                &.literal("12"),
+                &.boundary,
+            }),
+            .input = "ab-12",
+            .expected = "ab-12",
+        },
+        .{
+            .re = &.concat(&.{
+                &.literal("ab"),
+                &.boundary,
+                &.literal("cd"),
+            }),
+            .input = "abcd",
+            .expected = null,
         },
     };
 
