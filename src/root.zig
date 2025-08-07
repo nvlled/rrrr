@@ -422,7 +422,7 @@ const LazyIterator = struct {
         if (self.iterations <= max + 1) {
             self.iterations += 1;
             self.pos = 0;
-            self.pos = 0;
+            self.len = 0;
             return .{ .pos = self.pos, .len = self.len };
         }
 
@@ -455,42 +455,29 @@ const GreedyIterator = struct {
 
             var n: usize = 0;
             var input = self.input;
+            var lengths = &self.lengths;
 
             // skip first few matches until min
             while (n < self.min) {
                 if (try self.re.match(allocator, input[self.pos..], state)) |m| {
                     self.pos = m.pos;
-                    self.len = m.len;
                     n += 1;
                 } else return null;
             }
 
-            var matched = false;
-            var i: usize = 0;
-
-            if (n == 0) {
-                try self.lengths.append(allocator, 0);
-                matched = true;
-            }
+            if (n == 0) try lengths.append(allocator, 0);
 
             while (true) {
                 if (self.max) |max| {
-                    if (self.lengths.items.len >= max) break;
+                    if (lengths.items.len >= max) break;
                 }
 
-                if (try self.re.match(allocator, input[i..], state)) |m| {
-                    if (!matched) {
-                        self.pos = m.pos;
-                    }
-                    matched = true;
+                if (try self.re.match(allocator, input[self.pos + self.len ..], state)) |m| {
                     self.len += m.len;
-                    i += m.pos + m.len;
-
-                    try self.lengths.append(allocator, self.len);
+                    if (lengths.items.len == 0) self.pos = m.pos;
+                    try lengths.append(allocator, self.len);
                 } else break;
             }
-
-            return if (!matched) null else .{ .pos = self.pos, .len = self.len };
         }
 
         if (self.lengths.pop()) |len| {
