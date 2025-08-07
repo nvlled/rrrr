@@ -1,11 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-// seems doable and simple
-// regex but without using dumb cryptic string patterns
-// doing it like this isn't that too dissimilar from lpeg
-// zig doesn't have regex anyway yet in the stdlib
-// .
 const Regex = union(enum) {
     const Self = @This();
     const RE = *const @This();
@@ -19,30 +14,42 @@ const Regex = union(enum) {
         greedy: bool,
     },
 
-    _capture: RE,
-
-    _backref: usize,
-
-    boundary: void,
-    word: void,
-    digits: void,
-    alphabet: void,
-    alphanumeric: void,
-    any: void,
-
     _alt: []const RE,
 
     _concat: []const RE,
 
+    _capture: RE,
+
+    _backref: usize,
+
+    any,
+    _start,
+    _end,
+
+    boundary,
+    word,
+    digit,
+    alphabet,
+    alphanum,
+    whitespace,
+
+    @"!boundary",
+    @"!word",
+    @"!digit",
+    @"!alphabet",
+    @"!alphanum",
+    @"!whitespace",
+
     _char_range: struct {
         start: u8,
         end: u8,
+        negate: bool = false,
     },
 
-    _negate: RE, // only applicable to character ranges?
-
-    input_start: void,
-    input_end: void,
+    _char_set: struct {
+        value: []const u8,
+        negate: bool = false,
+    },
 
     pub const Match = struct {
         pos: usize,
@@ -180,14 +187,85 @@ const Regex = union(enum) {
     }
 
     fn match(self: @This(), allocator: Allocator, input: []const u8, state: *SearchState) Allocator.Error!?Match {
+        if (input.len == 0) return null;
+
+        const match_one: Match = .{ .pos = 0, .len = 1 };
         return switch (self) {
-            .any => {
-                if (input.len == 0)
-                    return null;
-                return .{ .pos = 0, .len = 1 };
+            .any => return match_one,
+
+            .word => {
+                return switch (input[0]) {
+                    '0'...'9', 'A'...'Z', 'a'...'z', '_' => match_one,
+                    else => null,
+                };
             },
+            .@"!word" => {
+                return switch (input[0]) {
+                    '0'...'9', 'A'...'Z', 'a'...'z', '_' => null,
+                    else => match_one,
+                };
+            },
+
+            .alphanum => {
+                return switch (input[0]) {
+                    '0'...'9', 'A'...'Z', 'a'...'z' => match_one,
+                    else => null,
+                };
+            },
+            .@"!alphanum" => {
+                return switch (input[0]) {
+                    '0'...'9', 'A'...'Z', 'a'...'z' => null,
+                    else => match_one,
+                };
+            },
+
+            .alphabet => {
+                return switch (input[0]) {
+                    'A'...'Z', 'a'...'z' => match_one,
+                    else => null,
+                };
+            },
+            .@"!alphabet" => {
+                return switch (input[0]) {
+                    else => match_one,
+                    'A'...'Z', 'a'...'z' => null,
+                };
+            },
+
+            .digit => {
+                return switch (input[0]) {
+                    '0'...'9' => match_one,
+                    else => null,
+                };
+            },
+            .@"!digit" => {
+                return switch (input[0]) {
+                    else => match_one,
+                    '0'...'9' => null,
+                };
+            },
+
+            .whitespace => {
+                return switch (input[0]) {
+                    ' ',
+                    '\t',
+                    '\n',
+                    '\r',
+                    0xC, // form feed \f
+                    0xB, // vertical tab \v
+                    0x85, // next line
+                    => .{ .pos = 0, .len = 1 },
+                    else => null,
+                };
+            },
+            .@"!whitespace" => {
+                const re: Regex = .whitespace;
+                const m = try re.match(allocator, input, state);
+                return if (m == null) .{ .pos = 0, .len = 1 } else null;
+            },
+
             ._literal => |val| {
-                if (val.len == 0 or input.len == 0)
+                if (val.len == 0)
                     return null;
                 if (std.mem.eql(u8, val, input[0..@min(val.len, input.len)]))
                     return .{ .pos = 0, .len = val.len };
@@ -250,6 +328,34 @@ const Regex = union(enum) {
 
     fn literal(value: []const u8) Self {
         return .{ ._literal = value };
+    }
+
+    fn oneOf(value: []const u8) Self {
+        return .{ ._char_set = .{
+            .value = value,
+            .negate = false,
+        } };
+    }
+    fn @"!oneOf"(value: []const u8) Self {
+        return .{ ._ch = .{
+            .value = value,
+            ._char_set = true,
+        } };
+    }
+
+    fn range(start: u8, end: u8) Self {
+        return .{ ._char_range = .{
+            .start = start,
+            .end = end,
+            .negate = false,
+        } };
+    }
+    fn @"!range"(start: u8, end: u8) Self {
+        return .{ ._char_range = .{
+            .start = start,
+            .end = end,
+            .negate = true,
+        } };
     }
 
     fn zeroOrOne(re: RE) Self {
@@ -661,7 +767,7 @@ test {
         .{
             .re = &.concat(&.{
                 &.literal("a"),
-                &.@"*?"(&.any),
+                &.zeroOrMore(&.any),
                 &.literal("x"),
             }),
             .input = "abcdxefghxij",
@@ -703,6 +809,37 @@ test {
             }),
             .input = "aabbaabbaabcca",
             .expected = "aabbaabb",
+        },
+        .{
+            .re = &.oneOrMoreAll(&.word),
+            .input = "abcd1234",
+            .expected = "abcd1234",
+        },
+        .{
+            .re = &.zeroOrMoreAll(&.word),
+            .input = "abcd1234",
+            .expected = "abcd1234",
+        },
+
+        .{
+            .re = &.concat(&.{
+                &.times(4, &.word),
+                &.@"!word",
+                &.oneOrMore(&.digit),
+            }),
+            .input = "abcd.123",
+            .expected = "abcd.1",
+        },
+
+        .{
+            .re = &.concat(&.{
+                &.times(4, &.word),
+                &.@"!word",
+                &.oneOrMoreAll(&.digit),
+                &.@"!digit",
+            }),
+            .input = "abcd.1234x-xyz",
+            .expected = "abcd.1234x",
         },
     };
 
