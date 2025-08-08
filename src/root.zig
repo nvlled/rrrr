@@ -168,9 +168,9 @@ const Regex = union(enum) {
         return self.match(allocator, .{ .value = input, .pos = 0 }, &state);
     }
 
-    fn handle_concat(
+    fn handleConcat(
         allocator: Allocator,
-        input: Input,
+        input_arg: Input,
         state: *SearchState,
         args: []const RE,
     ) !?Match {
@@ -179,22 +179,46 @@ const Regex = union(enum) {
         const size = state.captures.items.len;
         defer state.captures.shrinkRetainingCapacity(size);
 
-        const re = args[0];
-        const rest_args = args[1..];
+        var i: usize = 0;
+        var input = input_arg;
+        var result: Match = .{ .pos = 0, .len = 0 };
+
+        // The following loop is an optimization to reduce function calls
+        // by recursing only on .repetition.
+        // The loop can be removed without affecting the result.
+        loop: while (true) : (i += 1) {
+            var re = args[i];
+            switch (re.*) {
+                ._repetition => break :loop,
+                else => {},
+            }
+            const m = try re.match(allocator, input, state) orelse return null;
+            if (i == 0) result.pos = m.pos;
+            result.len += m.len;
+            input = input.slice(m.len);
+
+            if (i >= args.len - 1) {
+                return result;
+            }
+        }
+
+        const re = args[i];
+        const rest_args = args[i + 1 ..];
 
         var iterator: Iterator = .init(re, input, state);
         defer iterator.deinit(allocator);
 
-        // TODO: reduce function calls by checking
-        // if checking if arg is not a container regex
         while (try iterator.next(allocator)) |m| {
             const rest_input = input.slice(m.pos + m.len);
-            if (rest_args.len == 0) return m;
+            if (rest_args.len == 0) return .{
+                .pos = result.pos,
+                .len = result.len + m.len,
+            };
 
-            if (try handle_concat(allocator, rest_input, state, rest_args)) |m2| {
+            if (try handleConcat(allocator, rest_input, state, rest_args)) |m2| {
                 return .{
-                    .pos = m.pos,
-                    .len = m.len + m2.len,
+                    .pos = result.pos,
+                    .len = result.len + m.len + m2.len,
                 };
             }
         }
@@ -202,7 +226,7 @@ const Regex = union(enum) {
         return null;
     }
 
-    fn handle_concat_alt(
+    fn handleConcatIterative(
         allocator: Allocator,
         input: []const u8,
         state: *SearchState,
@@ -366,9 +390,9 @@ const Regex = union(enum) {
                 return result;
             },
 
-            ._repetition => handle_concat(allocator, input_arg, state, &.{&self}),
+            ._repetition => handleConcat(allocator, input_arg, state, &.{&self}),
 
-            ._concat => |args| handle_concat(allocator, input_arg, state, args),
+            ._concat => |args| handleConcat(allocator, input_arg, state, args),
 
             else => {
                 std.debug.print("TODO: {s}\n", .{@tagName(self)});
@@ -1020,6 +1044,17 @@ test {
             }),
             .input = "xw",
             .expected = "xw",
+        },
+        .{
+            .re = &.concat(&.{
+                &.literal("a"),
+                &.literal("b"),
+                &.zeroOrMore(&.alphabet),
+                &.zeroOrMore(&.digit),
+                &.literal("a"),
+            }),
+            .input = "abcd1234abcd",
+            .expected = "abcd1234a",
         },
     };
 
