@@ -1,6 +1,36 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+const U8Enum = enum(u8) {
+
+    // TODO: better way of doing this?
+    // zig fmt: off
+    _0, _1, _2, _3, _4, _5, _6, _7, _8, _9, _10, _11, _12, _13, _14, _15, _16, _17, _18,
+    _19, _20, _21, _22, _23, _24, _25, _26, _27, _28, _29, _30, _31, _32, _33, _34, _35,
+    _36, _37, _38, _39, _40, _41, _42, _43, _44, _45, _46, _47, _48, _49, _50, _51, _52,
+    _53, _54, _55, _56, _57, _58, _59, _60, _61, _62, _63, _64, _65, _66, _67, _68, _69,
+    _70, _71, _72, _73, _74, _75, _76, _77, _78, _79, _80, _81, _82, _83, _84, _85, _86,
+    _87, _88, _89, _90, _91, _92, _93, _94, _95, _96, _97, _98, _99, _100, _101, _102,
+    _103, _104, _105, _106, _107, _108, _109, _110, _111, _112, _113, _114, _115, _116,
+    _117, _118, _119, _120, _121, _122, _123, _124, _125, _126, _127, _128, _129, _130,
+    _131, _132, _133, _134, _135, _136, _137, _138, _139, _140, _141, _142, _143, _144,
+    _145, _146, _147, _148, _149, _150, _151, _152, _153, _154, _155, _156, _157, _158,
+    _159, _160, _161, _162, _163, _164, _165, _166, _167, _168, _169, _170, _171, _172,
+    _173, _174, _175, _176, _177, _178, _179, _180, _181, _182, _183, _184, _185, _186,
+    _187, _188, _189, _190, _191, _192, _193, _194, _195, _196, _197, _198, _199, _200,
+    _201, _202, _203, _204, _205, _206, _207, _208, _209, _210, _211, _212, _213, _214,
+    _215, _216, _217, _218, _219, _220, _221, _222, _223, _224, _225, _226, _227, _228,
+    _229, _230, _231, _232, _233, _234, _235, _236, _237, _238, _239, _240, _241, _242,
+    _243, _244, _245, _246, _247, _248, _249, _250, _251, _252, _253, _254,
+    // zig fmt: on
+
+    fn enumSet(str: []const u8) std.EnumSet(@This()) {
+        var set: std.EnumSet(U8Enum) = .initEmpty();
+        for (str) |c| set.insert(@enumFromInt(c));
+        return set;
+    }
+};
+
 const Regex = union(enum) {
     const Self = @This();
     const RE = *const @This();
@@ -22,11 +52,11 @@ const Regex = union(enum) {
 
     _backref: usize,
 
-    any,
-    _start,
-    _end,
-
+    start,
+    end,
     boundary,
+
+    any,
     word,
     digit,
     alphabet,
@@ -40,16 +70,7 @@ const Regex = union(enum) {
     @"!alphanum",
     @"!whitespace",
 
-    _char_range: struct {
-        start: u8,
-        end: u8,
-        negate: bool = false,
-    },
-
-    _char_set: struct {
-        value: []const u8,
-        negate: bool = false,
-    },
+    _charset: std.EnumSet(U8Enum),
 
     pub const Match = struct {
         pos: usize,
@@ -103,6 +124,42 @@ const Regex = union(enum) {
         }
     };
 
+    const CharClass = struct {
+        const digit = U8Enum.enumSet("0123456789");
+        const alphabet = U8Enum.enumSet("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ");
+        const underscore = U8Enum.enumSet("_");
+        const whitespace = U8Enum.enumSet(" \t\n\r\x0C\x0B\x85");
+        const any = U8Enum.enumSet("").complement();
+        const alphanum = digit.unionWith(alphabet);
+        const word = alphanum.unionWith(underscore);
+
+        const not_word = word.complement();
+        const not_digit = digit.complement();
+        const not_alphabet = alphabet.complement();
+        const not_alphanum = alphanum.complement();
+        const not_whitespace = whitespace.complement();
+
+        inline fn isWord(ch: u8) bool {
+            return word.contains(@enumFromInt(ch));
+        }
+
+        fn get(re: Regex) ?std.EnumSet(U8Enum) {
+            return switch (re) {
+                .word => word,
+                .digit => digit,
+                .alphabet => alphabet,
+                .alphanum => alphanum,
+                .whitespace => whitespace,
+                .@"!word" => not_word,
+                .@"!digit" => not_digit,
+                .@"!alphabet" => not_alphabet,
+                .@"!alphanum" => not_alphanum,
+                .@"!whitespace" => not_whitespace,
+                else => null,
+            };
+        }
+    };
+
     fn search(self: @This(), allocator: Allocator, input: []const u8) Allocator.Error!?Match {
         var state: SearchState = .{
             .captures = .{},
@@ -128,6 +185,8 @@ const Regex = union(enum) {
         var iterator: Iterator = .init(re, input, state);
         defer iterator.deinit(allocator);
 
+        // TODO: reduce function calls by checking
+        // if checking if arg is not a container regex
         while (try iterator.next(allocator)) |m| {
             const rest_input = input.slice(m.pos + m.len);
             if (rest_args.len == 0) return m;
@@ -224,82 +283,52 @@ const Regex = union(enum) {
         return null;
     }
 
-    inline fn isWordChar(ch: u8) bool {
-        return switch (ch) {
-            '0'...'9', 'A'...'Z', 'a'...'z', '_' => true,
-            else => false,
-        };
-    }
-
     fn match(self: @This(), allocator: Allocator, input_arg: Input, state: *SearchState) Allocator.Error!?Match {
-        const input = input_arg.string();
         const match_one: Match = .{ .pos = 0, .len = 1 };
+        const match_zero: Match = .{ .pos = 0, .len = 0 };
 
-        if (input.len == 0 and self != .boundary) return null;
+        switch (self) {
+            .boundary, .start, .end => {},
+            else => {
+                const input = input_arg.string();
+                if (input.len == 0) return null;
+                if (CharClass.get(self)) |set| {
+                    const elem: U8Enum = @enumFromInt(input[0]);
+                    return if (set.contains(elem)) match_one else null;
+                }
+            },
+        }
 
         return switch (self) {
             .any => match_one,
 
-            .word => if (isWordChar(input[0])) match_one else null,
-            .@"!word" => if (!isWordChar(input[0])) match_one else null,
-
-            .alphanum => switch (input[0]) {
-                '0'...'9', 'A'...'Z', 'a'...'z' => match_one,
-                else => null,
-            },
-            .@"!alphanum" => switch (input[0]) {
-                '0'...'9', 'A'...'Z', 'a'...'z' => null,
-                else => match_one,
+            ._charset => |set| {
+                const input = input_arg.string();
+                const elem: U8Enum = @enumFromInt(input[0]);
+                return if (set.contains(elem)) match_one else null;
             },
 
-            .alphabet => switch (input[0]) {
-                'A'...'Z', 'a'...'z' => match_one,
-                else => null,
-            },
-            .@"!alphabet" => switch (input[0]) {
-                else => match_one,
-                'A'...'Z', 'a'...'z' => null,
-            },
-
-            .digit => switch (input[0]) {
-                '0'...'9' => match_one,
-                else => null,
-            },
-            .@"!digit" => switch (input[0]) {
-                else => match_one,
-                '0'...'9' => null,
-            },
-
-            .whitespace => switch (input[0]) {
-                ' ',
-                '\t',
-                '\n',
-                '\r',
-                0xC, // form feed \f
-                0xB, // vertical tab \v
-                0x85, // next line
-                => match_one,
-                else => null,
-            },
-            .@"!whitespace" => {
-                const re: Regex = .whitespace;
-                const m = try re.match(allocator, input_arg, state);
-                return if (m == null) match_one else null;
+            .start => if (input_arg.pos == 0) match_zero else null,
+            .end => {
+                const len = input_arg.size();
+                return if (len == 0 or input_arg.pos == len - 1) match_zero else null;
             },
 
             .boundary => {
-                const match_zero: Match = .{ .pos = 0, .len = 0 };
                 const prev = input_arg.prev() orelse return match_zero;
                 const next = input_arg.current() orelse return match_zero;
 
+                const is_prev_word = CharClass.isWord(prev);
+                const is_next_word = CharClass.isWord(next);
                 const matched =
-                    isWordChar(prev) and !isWordChar(next) or
-                    !isWordChar(prev) and isWordChar(next);
+                    is_prev_word and !is_next_word or
+                    !is_prev_word and is_next_word;
 
                 return if (matched) match_zero else null;
             },
 
             ._literal => |val| {
+                const input = input_arg.string();
                 if (std.mem.eql(u8, val, input[0..@min(val.len, input.len)]))
                     return .{ .pos = 0, .len = val.len }
                 else
@@ -320,6 +349,7 @@ const Regex = union(enum) {
                 defer state.captures.shrinkRetainingCapacity(size);
 
                 if (index >= 0 and index < state.captures.items.len) {
+                    const input = input_arg.string();
                     const val = state.captures.items[index];
                     if (val.len > 0 and std.mem.eql(u8, val, input[0..@min(val.len, input.len)]))
                         return .{ .pos = 0, .len = val.len };
@@ -330,6 +360,7 @@ const Regex = union(enum) {
             ._capture => |re| {
                 const result = try re.match(allocator, input_arg, state);
                 if (result) |m| {
+                    const input = input_arg.string();
                     try state.captures.append(allocator, m.value(input));
                 }
                 return result;
@@ -367,44 +398,42 @@ const Regex = union(enum) {
         return .{ ._literal = value };
     }
 
-    fn oneOf(value: []const u8) Self {
-        return .{ ._char_set = .{
-            .value = value,
-            .negate = false,
-        } };
+    fn anyChar(value: []const u8) Self {
+        var set: std.EnumSet(U8Enum) = .initEmpty();
+        for (value) |c| set.insert(@enumFromInt(c));
+        return .{ ._charset = set };
     }
-    fn @"!oneOf"(value: []const u8) Self {
-        return .{ ._ch = .{
-            .value = value,
-            ._char_set = true,
-        } };
+    fn @"!anyChar"(value: []const u8) Self {
+        var set: std.EnumSet(U8Enum) = .initEmpty();
+        for (value) |c| set.insert(@enumFromInt(c));
+        return .{ ._charset = set.complement() };
     }
 
     fn range(start: u8, end: u8) Self {
-        return .{ ._char_range = .{
-            .start = start,
-            .end = end,
-            .negate = false,
-        } };
+        var set: std.EnumSet(U8Enum) = .initEmpty();
+        for (start..end) |c| set.insert(@enumFromInt(c));
+        return .{ ._charset = set };
     }
     fn @"!range"(start: u8, end: u8) Self {
-        return .{ ._char_range = .{
-            .start = start,
-            .end = end,
-            .negate = true,
-        } };
+        var set: std.EnumSet(U8Enum) = .initEmpty();
+        for (start..end) |c| set.insert(@enumFromInt(c));
+        return .{ ._charset = set.complement() };
     }
 
-    fn zeroOrOne(re: RE) Self {
+    fn either(args: []const RE) Self {
+        return .{ ._alt = args };
+    }
+
+    fn optional(re: RE) Self {
         return .{
-            ._zero_or_one = .{
+            ._repetition = .{
                 .re = re,
                 .greedy = false,
             },
         };
     }
 
-    fn zeroOrMore(re: RE) Self {
+    fn @"zeroOrMore?"(re: RE) Self {
         return .{
             ._repetition = .{
                 .re = re,
@@ -414,7 +443,7 @@ const Regex = union(enum) {
         };
     }
 
-    fn zeroOrMoreAll(re: RE) Self {
+    fn zeroOrMore(re: RE) Self {
         return .{
             ._repetition = .{
                 .re = re,
@@ -428,17 +457,17 @@ const Regex = union(enum) {
         return .{
             ._repetition = .{
                 .re = re,
-                .greedy = false,
+                .greedy = true,
                 .min = 1,
             },
         };
     }
 
-    fn oneOrMoreAll(re: RE) Self {
+    fn @"oneOrMore?"(re: RE) Self {
         return .{
             ._repetition = .{
                 .re = re,
-                .greedy = true,
+                .greedy = false,
                 .min = 1,
             },
         };
@@ -449,6 +478,16 @@ const Regex = union(enum) {
             ._repetition = .{
                 .re = re,
                 .greedy = true,
+                .min = count,
+            },
+        };
+    }
+
+    fn @"atLeast?"(count: usize, re: RE) Self {
+        return .{
+            ._repetition = .{
+                .re = re,
+                .greedy = false,
                 .min = count,
             },
         };
@@ -465,11 +504,33 @@ const Regex = union(enum) {
         };
     }
 
+    fn @"atMost?"(count: usize, re: RE) Self {
+        return .{
+            ._repetition = .{
+                .re = re,
+                .greedy = false,
+                .min = 0,
+                .max = count,
+            },
+        };
+    }
+
     fn around(min: usize, max: usize, re: RE) Self {
         return .{
             ._repetition = .{
                 .re = re,
                 .greedy = true,
+                .min = min,
+                .max = max,
+            },
+        };
+    }
+
+    fn @"around?"(min: usize, max: usize, re: RE) Self {
+        return .{
+            ._repetition = .{
+                .re = re,
+                .greedy = false,
                 .min = min,
                 .max = max,
             },
@@ -488,13 +549,13 @@ const Regex = union(enum) {
     }
 
     inline fn @"*"(re: RE) Self {
-        return zeroOrMoreAll(re);
+        return zeroOrMore(re);
     }
     inline fn @"+"(re: RE) Self {
-        return oneOrMoreAll(re);
+        return @"oneOrMore?"(re);
     }
     inline fn @"*?"(re: RE) Self {
-        return zeroOrMore(re);
+        return @"zeroOrMore?"(re);
     }
     inline fn @"+?"(re: RE) Self {
         return oneOrMore(re);
@@ -510,10 +571,6 @@ const Regex = union(enum) {
 
     fn capture(re: RE) Self {
         return .{ ._capture = re };
-    }
-
-    fn captureAll(contents: []const RE) Self {
-        return .capture(.concat(contents));
     }
 };
 
@@ -763,18 +820,18 @@ test {
             .expected = "aa",
         },
         .{
-            .re = &.zeroOrMoreAll(&.literal("a")),
+            .re = &.zeroOrMore(&.literal("a")),
             .input = "qwersdfz",
             .expected = "",
         },
         .{
-            .re = &.zeroOrMoreAll(&.literal("a")),
+            .re = &.zeroOrMore(&.literal("a")),
             .input = "aaaqwersdfz",
             .expected = "aaa",
         },
         .{
             .re = &.concat(&.{
-                &.zeroOrMoreAll(&.literal("a")),
+                &.zeroOrMore(&.literal("a")),
                 &.literal("a"),
             }),
             .input = "aaabbbcca",
@@ -782,11 +839,11 @@ test {
         },
         .{
             .re = &.concat(&.{
-                &.zeroOrMoreAll(&.literal("a")),
-                &.zeroOrMoreAll(&.literal("a")),
+                &.zeroOrMore(&.literal("a")),
+                &.zeroOrMore(&.literal("a")),
                 &.literal("aa"),
                 &.literal("b"),
-                &.zeroOrMoreAll(&.literal("c")),
+                &.zeroOrMore(&.literal("c")),
             }),
             .input = "aaaaab",
             .expected = "aaaaab",
@@ -794,7 +851,7 @@ test {
         .{
             .re = &.concat(&.{
                 &.literal("a"),
-                &.zeroOrMoreAll(&.any),
+                &.zeroOrMore(&.any),
                 &.literal("x"),
             }),
             .input = "abcdxefghxij",
@@ -804,7 +861,7 @@ test {
         .{
             .re = &.concat(&.{
                 &.literal("a"),
-                &.zeroOrMore(&.any),
+                &.@"zeroOrMore?"(&.any),
                 &.literal("x"),
             }),
             .input = "abcdxefghxij",
@@ -813,7 +870,7 @@ test {
         .{
             .re = &.concat(&.{
                 &.literal("a"),
-                &.zeroOrMore(&.any),
+                &.@"zeroOrMore?"(&.any),
                 &.literal("x"),
             }),
             .input = "axefghxij",
@@ -822,7 +879,7 @@ test {
         .{
             .re = &.concat(&.{
                 &.literal("a"),
-                &.zeroOrMoreAll(&.any),
+                &.zeroOrMore(&.any),
                 &.literal("x"),
             }),
             .input = "axefghij",
@@ -831,7 +888,7 @@ test {
 
         .{
             .re = &.concat(&.{
-                &.zeroOrMoreAll(&.literal("a")),
+                &.zeroOrMore(&.literal("a")),
                 &.literal("bc"),
             }),
             .input = "aabbaabaabcca",
@@ -839,7 +896,7 @@ test {
         },
         .{
             .re = &.concat(&.{
-                &.capture(&.zeroOrMoreAll(&.literal("a"))),
+                &.capture(&.zeroOrMore(&.literal("a"))),
                 &.capture(&.literal("bb")),
                 &.backref(0),
                 &.backref(1),
@@ -848,12 +905,12 @@ test {
             .expected = "aabbaabb",
         },
         .{
-            .re = &.oneOrMoreAll(&.word),
+            .re = &.oneOrMore(&.word),
             .input = "abcd1234",
             .expected = "abcd1234",
         },
         .{
-            .re = &.zeroOrMoreAll(&.word),
+            .re = &.zeroOrMore(&.word),
             .input = "abcd1234",
             .expected = "abcd1234",
         },
@@ -862,7 +919,7 @@ test {
             .re = &.concat(&.{
                 &.times(4, &.word),
                 &.@"!word",
-                &.oneOrMore(&.digit),
+                &.@"oneOrMore?"(&.digit),
             }),
             .input = "abcd.123",
             .expected = "abcd.1",
@@ -872,7 +929,7 @@ test {
             .re = &.concat(&.{
                 &.times(4, &.word),
                 &.@"!word",
-                &.oneOrMoreAll(&.digit),
+                &.@"oneOrMore?"(&.digit),
                 &.@"!digit",
             }),
             .input = "abcd.1234x-xyz",
@@ -900,6 +957,70 @@ test {
             .input = "abcd",
             .expected = null,
         },
+        .{
+            .re = &.concat(&.{
+                &.start,
+                &.literal("abcd"),
+                &.end,
+            }),
+            .input = "abcd",
+            .expected = "abcd",
+        },
+        .{
+            .re = &.concat(&.{
+                &.start,
+                &.literal("abcd"),
+                &.end,
+            }),
+            .input = "abcdefg",
+            .expected = null,
+        },
+        .{
+            .re = &.either(&.{
+                &.literal("abcd"),
+                &.literal("xyz"),
+            }),
+            .input = "abcdefg",
+            .expected = "abcd",
+        },
+        .{
+            .re = &.either(&.{
+                &.literal("abcd"),
+                &.literal("898989"),
+                &.zeroOrMore(&.alphabet),
+            }),
+            .input = "xyz1abcdefg",
+            .expected = "xyz",
+        },
+        .{
+            .re = &.concat(&.{
+                &.anyChar("abcx"),
+                &.anyChar("xyzx"),
+                &.anyChar("zooz"),
+                &.@"!anyChar"("abcdef"),
+            }),
+            .input = "xyz1abcdefg",
+            .expected = "xyz1",
+        },
+        .{
+            .re = &.concat(&.{
+                &.@"!anyChar"("a"),
+                &.@"!anyChar"("a"),
+                &.@"!anyChar"("a"),
+                &.@"!anyChar"("a"),
+                &.anyChar("a"),
+            }),
+            .input = "bcdea",
+            .expected = "bcdea",
+        },
+        .{
+            .re = &.concat(&.{
+                &.range('x', 'z'),
+                &.@"!range"('x', 'z'),
+            }),
+            .input = "xw",
+            .expected = "xw",
+        },
     };
 
     for (tests) |item| {
@@ -919,3 +1040,21 @@ test {
         }
     }
 }
+
+// TODO: re.normalize(allocator) for optimization
+// - combine adjacent literals into a single literal
+//   - if all concat args is all literal, convert concat to single literal
+// - flatten nested concats
+// - expand char ranges into literal
+// - replace backrefs of captured literals with literals
+//   - not very useful since captures are done on character sets
+// - expand min repetition (if min is not too large)
+//   - atLeast(2, "foo") -> concat("foofoo", zeroOrMore("foo"))
+//   - atLeast(2, any) -> concat(any, any, zeroOrMore(any))
+// - extract common either cases
+//   - either("xyz", "xyyy", "xxx") -> concat("x", either("yz", "yyy", "xx"))
+// - combine either charsets
+// - if either contains only literals, use a hashmap
+//
+
+// .atLeastOne(.either("abc", "y"))
