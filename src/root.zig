@@ -156,17 +156,9 @@ const Regex = union(enum) {
         loop: while (i < args.len) : (i += 1) {
             const re = args[i];
             switch (re.*) {
-                ._repetition => break :loop,
-                ._capture => |sub_re| {
-                    const m = try sub_re.match(allocator, input, &state) orelse return null;
-                    if (i == 0) result.pos = m.pos;
-                    result.len += m.len;
-                    input = input.slice(m.len);
-                    state = state.addCapture(m.string(input.value));
-                },
+                ._repetition, ._capture => break :loop,
                 else => {
                     const m = try re.match(allocator, input, &state) orelse return null;
-                    if (i == 0) result.pos = m.pos;
                     result.len += m.len;
                     input = input.slice(m.len);
                 },
@@ -177,25 +169,40 @@ const Regex = union(enum) {
             return result;
         }
 
-        const re = args[i];
         const rest_args = args[i + 1 ..];
+        switch (args[i].*) {
+            ._repetition => {
+                var iterator: Iterator = .init(args[i], input, &state);
+                defer iterator.deinit(allocator);
 
-        var iterator: Iterator = .init(re, input, &state);
-        defer iterator.deinit(allocator);
+                while (try iterator.next(allocator)) |m| {
+                    const rest_input = input.slice(m.len);
+                    if (rest_args.len == 0) return .{
+                        .pos = result.pos,
+                        .len = result.len + m.len,
+                    };
 
-        while (try iterator.next(allocator)) |m| {
-            const rest_input = input.slice(m.len);
-            if (rest_args.len == 0) return .{
-                .pos = result.pos,
-                .len = result.len + m.len,
-            };
+                    if (try handleConcat(allocator, rest_input, &state, rest_args)) |m2| {
+                        return .{
+                            .pos = result.pos,
+                            .len = result.len + m.len + m2.len,
+                        };
+                    }
+                }
+            },
+            ._capture => |re| {
+                const m = try re.match(allocator, input, &state) orelse return null;
+                const rest_input = input.slice(m.len);
+                const sub_state = state.addCapture(m.string(input.value));
 
-            if (try handleConcat(allocator, rest_input, &state, rest_args)) |m2| {
-                return .{
-                    .pos = result.pos,
-                    .len = result.len + m.len + m2.len,
-                };
-            }
+                if (try handleConcat(allocator, rest_input, &sub_state, rest_args)) |m2| {
+                    return .{
+                        .pos = result.pos,
+                        .len = result.len + m.len + m2.len,
+                    };
+                }
+            },
+            else => unreachable,
         }
 
         return null;
@@ -327,8 +334,9 @@ const Regex = union(enum) {
                 if (index >= 0 and index < state.num_captures) {
                     const input = input_arg.string();
                     const item = (state.getCapture(index) orelse return null).value;
-                    if (item.len > 0 and std.mem.eql(u8, item, input[0..@min(item.len, input.len)]))
+                    if (item.len > 0 and std.mem.eql(u8, item, input[0..@min(item.len, input.len)])) {
                         return .{ .pos = input_arg.pos, .len = item.len };
+                    }
                 }
                 return null;
             },
@@ -909,11 +917,13 @@ test {
             .re = &.concat(&.{
                 &.capture(&.zeroOrMore(&.literal("a"))),
                 &.capture(&.literal("bb")),
+                &.capture(&.zeroOrMore(&.literal("x"))),
                 &.backref(0),
+                &.backref(2),
                 &.backref(1),
             }),
-            .input = "aabbaabbaabcca",
-            .expected = "aabbaabb",
+            .input = "aabbxxxxaaxxxxbbbcca",
+            .expected = "aabbxxxxaaxxxxbb",
         },
         .{
             .re = &.oneOrMore(&.word),
@@ -1043,6 +1053,13 @@ test {
             .input = "abcd1234abcd",
             .expected = "abcd1234a",
         },
+        .{
+            .re = &.concat(&.{
+                &.oneOrMore(&.literal("abc")),
+            }),
+            .input = "aaaaabcefg",
+            .expected = "abc",
+        },
     };
 
     for (tests) |item| {
@@ -1077,6 +1094,6 @@ test {
 //   - either("xyz", "xyyy", "xxx") -> concat("x", either("yz", "yyy", "xx"))
 // - combine either charsets
 // - if either contains only literals, use a hashmap
-//
+// - use a non-allocating iterator for literal repetitions
 
 // .atLeastOne(.either("abc", "y"))
