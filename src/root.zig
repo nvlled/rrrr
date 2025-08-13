@@ -56,34 +56,44 @@ const Regex = union(enum) {
 
     const Capture = struct {
         value: []const u8,
+        index: usize,
         parent: ?*const Capture,
     };
 
     const SearchState = struct {
-        captures: ?Capture = null,
-        num_captures: usize = 0,
+        capture: ?*const Capture = null,
+        input: *const Input = undefined,
 
         fn getCapture(self: @This(), index: usize) ?*const Capture {
-            var i: usize = self.num_captures - 1;
-            var cap = &(self.captures orelse return null);
-            while (true) : (i -= 1) {
-                if (i == index) return cap;
-                cap = cap.parent orelse return null;
+            var current = self.capture;
+            while (true) {
+                if (current) |cap| {
+                    if (cap.index == index) return cap;
+                    current = cap.parent;
+                } else return null;
             }
         }
 
-        fn addCapture(self: *const @This(), value: []const u8) SearchState {
+        fn withCapture(self: @This(), cap: *const Capture) SearchState {
             return .{
-                .num_captures = self.num_captures + 1,
-                .captures = .{
-                    .value = value,
-                    .parent = if (self.captures) |c| &c else null,
-                },
+                .capture = cap,
+                .input = self.input,
             };
+        }
+
+        fn withInput(self: @This(), input: *const Input) SearchState {
+            return .{
+                .capture = self.capture,
+                .input = input,
+            };
+        }
+
+        fn numCaptures(self: @This()) usize {
+            if (self.capture) |c| return c.index + 1;
+            return 0;
         }
     };
 
-    // I can probably put this inside the state too
     const Input = struct {
         value: []const u8,
         pos: usize,
@@ -136,21 +146,18 @@ const Regex = union(enum) {
         var state: SearchState = .{
             .captures = .{},
         };
-        defer state.captures.deinit(allocator);
-        return self.match(allocator, .{ .value = input, .pos = pos }, &state);
     }
 
     fn handleConcat(
         allocator: Allocator,
         input_arg: Input,
-        state_arg: *const SearchState,
+        state_arg: SearchState,
         args: []const RE,
     ) !?Match {
         if (args.len == 0) return .{ .pos = input_arg.pos, .len = 0 };
 
         var i: usize = 0;
         var input = input_arg;
-        var state = state_arg.*;
         var result: Match = .{ .pos = input_arg.pos, .len = 0 };
 
         loop: while (i < args.len) : (i += 1) {
@@ -158,7 +165,7 @@ const Regex = union(enum) {
             switch (re.*) {
                 ._repetition, ._capture => break :loop,
                 else => {
-                    const m = try re.match(allocator, input, &state) orelse return null;
+                    const m = try re.match(allocator, input, state_arg) orelse return null;
                     result.len += m.len;
                     input = input.slice(m.len);
                 },
@@ -172,7 +179,7 @@ const Regex = union(enum) {
         const rest_args = args[i + 1 ..];
         switch (args[i].*) {
             ._repetition => {
-                var iterator: Iterator = .init(args[i], input, &state);
+                var iterator: Iterator = .init(args[i], input, state_arg);
                 defer iterator.deinit(allocator);
 
                 while (try iterator.next(allocator)) |m| {
@@ -182,7 +189,7 @@ const Regex = union(enum) {
                         .len = result.len + m.len,
                     };
 
-                    if (try handleConcat(allocator, rest_input, &state, rest_args)) |m2| {
+                    if (try handleConcat(allocator, rest_input, state_arg, rest_args)) |m2| {
                         return .{
                             .pos = result.pos,
                             .len = result.len + m.len + m2.len,
@@ -191,11 +198,15 @@ const Regex = union(enum) {
                 }
             },
             ._capture => |re| {
-                const m = try re.match(allocator, input, &state) orelse return null;
+                const m = try re.match(allocator, input, state_arg) orelse return null;
                 const rest_input = input.slice(m.len);
-                const sub_state = state.addCapture(m.string(input.value));
+                const sub_state = state_arg.withCapture(&.{
+                    .value = m.string(input.value),
+                    .index = if (state_arg.capture) |c| c.index + 1 else 0,
+                    .parent = state_arg.capture,
+                });
 
-                if (try handleConcat(allocator, rest_input, &sub_state, rest_args)) |m2| {
+                if (try handleConcat(allocator, rest_input, sub_state, rest_args)) |m2| {
                     return .{
                         .pos = result.pos,
                         .len = result.len + m.len + m2.len,
@@ -208,14 +219,15 @@ const Regex = union(enum) {
         return null;
     }
 
+    // TODO: remove
     fn handleConcatIterative(
         allocator: Allocator,
         input: []const u8,
         state: *SearchState,
         args: []const RE,
     ) !?Match {
-        const size = state.captures.items.len;
-        defer state.captures.shrinkRetainingCapacity(size);
+        const size = state.capture.items.len;
+        defer state.capture.shrinkRetainingCapacity(size);
 
         if (args.len == 0) return null;
 
@@ -246,7 +258,7 @@ const Regex = union(enum) {
                 true => {
                     const s = snapshot.pop() orelse break;
                     const capture_size = s.capture_size;
-                    state.captures.shrinkRetainingCapacity(capture_size);
+                    state.capture.shrinkRetainingCapacity(capture_size);
 
                     i = s.arg_index;
                     result = s.match;
@@ -275,21 +287,21 @@ const Regex = union(enum) {
                     .match = result,
                     .iterator = iterator,
                     .arg_index = i,
-                    .capture_size = state.captures.items.len,
+                    .capture_size = state.capture.items.len,
                 }),
             }
 
             result.len += m.len;
             if (i == 0) result.pos = m.pos;
             if (i >= args.len - 1) return result;
-            if (capture_result) try state.captures.append(allocator, m.value(str));
+            if (capture_result) try state.capture.append(allocator, m.value(str));
             i += 1;
         }
 
         return null;
     }
 
-    fn match(self: Self, allocator: Allocator, input_arg: Input, state: *const SearchState) Allocator.Error!?Match {
+    fn match(self: Self, allocator: Allocator, input_arg: Input, state: SearchState) Allocator.Error!?Match {
         const match_one: Match = .{ .pos = input_arg.pos, .len = 1 };
         const match_zero: Match = .{ .pos = input_arg.pos, .len = 0 };
 
@@ -331,7 +343,7 @@ const Regex = union(enum) {
             },
 
             ._backref => |index| {
-                if (index >= 0 and index < state.num_captures) {
+                if (index >= 0 and index < state.numCaptures()) {
                     const input = input_arg.string();
                     const item = (state.getCapture(index) orelse return null).value;
                     if (item.len > 0 and std.mem.eql(u8, item, input[0..@min(item.len, input.len)])) {
@@ -595,7 +607,7 @@ const Regex = union(enum) {
 
 const LazyIterator = struct {
     re: Regex.RE,
-    state: *const Regex.SearchState,
+    state: Regex.SearchState,
     input: Regex.Input,
     pos: usize = 0,
     len: usize = 0,
@@ -651,7 +663,7 @@ const LazyIterator = struct {
 
 const GreedyIterator = struct {
     re: Regex.RE,
-    state: *const Regex.SearchState,
+    state: Regex.SearchState,
     input: Regex.Input,
     pos: usize = 0,
     len: usize = 0,
@@ -710,7 +722,7 @@ const GreedyIterator = struct {
 
 const SingleIterator = struct {
     re: Regex.RE,
-    state: *const Regex.SearchState,
+    state: Regex.SearchState,
     input: Regex.Input,
     pos: usize = 0,
     len: usize = 0,
@@ -744,7 +756,7 @@ const Iterator = union(enum) {
     fn init(
         re: Regex.RE,
         input: Regex.Input,
-        state: *const Regex.SearchState,
+        state: Regex.SearchState,
     ) Self {
         return switch (re.*) {
             ._repetition => |val| if (val.greedy) .{ .greedy = GreedyIterator{
