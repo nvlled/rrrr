@@ -150,16 +150,82 @@ const Regex = union(enum) {
         }
     };
 
-    fn search(self: @This(), allocator: Allocator, input: []const u8) Allocator.Error!?Match {
-        var state: SearchState = .{
-            .captures = .{},
+    const MatchIterator = struct {
+        re: RE,
+        prefix: ?[]const u8,
+        state: SearchState,
+
+        fn init(re: Regex.RE, source: []const u8) MatchIterator {
+            return .{
+                .re = re,
+                .prefix = getLiteralPrefix(re),
+                .state = .{
+                    .input = .{
+                        .value = source,
+                        .pos = 0,
+                    },
+                    .capture = null,
+                },
+            };
+        }
+
+        fn next(self: *@This(), allocator: Allocator) Allocator.Error!?Match {
+            const re = self.re;
+
+            while (self.state.input.hasMore()) {
+                const input = self.state.input;
+                if (self.prefix) |prefix| {
+                    self.state.input.pos = std.mem.indexOfPos(u8, input.value, input.pos, prefix) orelse {
+                        return null;
+                    };
+                }
+
+                if (try re.match(allocator, self.state)) |m| {
+                    self.state.input = self.state.input.slice(m.len);
+                    return m;
+                }
+                self.state.input.pos += 1;
+            }
+
+            return null;
+        }
+    };
+
+    fn getLiteralPrefix(self: RE) ?[]const u8 {
+        return switch (self.*) {
+            ._literal => |val| val,
+            ._concat => |args| {
+                for (args) |re| {
+                    if (getLiteralPrefix(re)) |prefix| return prefix;
+                }
+                return null;
+            },
+            ._capture => |re| getLiteralPrefix(re),
+            ._repetition => |val| {
+                if (val.min == 0) return "";
+                if (getLiteralPrefix(val.re)) |prefix| return prefix;
+                return null;
+            },
+            else => return null,
+        };
+    }
+
+    fn search(self: Self, allocator: Allocator, input: []const u8) Allocator.Error!?Match {
+        var pos: usize = 0;
+        if (getLiteralPrefix(&self)) |prefix| {
+            if (std.mem.indexOf(u8, input, prefix)) |i| pos = i;
+        }
+
+        const state: SearchState = .{
+            .input = .{ .value = input, .pos = pos },
+            .capture = null,
         };
         return self.match(allocator, state);
     }
 
-    // TODO:
-    // const match_iter = re.searchAll();
-    // defer match_iter.deinit();
+    fn searchAll(self: RE, source: []const u8) MatchIterator {
+        return MatchIterator.init(self, source);
+    }
 
     fn handleConcat(
         allocator: Allocator,
@@ -1097,6 +1163,29 @@ test {
         } else {
             try std.testing.expect(result == null);
         }
+    }
+}
+
+test "match iterator" {
+    const expected: []const []const u8 = &.{
+        "aabc",
+        "abc",
+        "aaabc",
+        "abc",
+        "aaaabc",
+    };
+    const re: Regex.RE = &.concat(&.{
+        &.oneOrMore(&.literal("a")),
+        &.literal("bc"),
+    });
+    const source = "aabcabc   aaabcasdjfabciasofaaaabca";
+    var iterator = re.searchAll(source);
+
+    var i: usize = 0;
+    while (try iterator.next(std.testing.allocator)) |m| {
+        try std.testing.expect(i < expected.len);
+        try std.testing.expectEqualStrings(expected[i], m.string(source));
+        i += 1;
     }
 }
 
