@@ -54,15 +54,9 @@ const Regex = union(enum) {
         }
     };
 
-    const Capture = struct {
-        value: []const u8,
-        index: usize,
-        parent: ?*const Capture,
-    };
-
     const SearchState = struct {
-        capture: ?*const Capture = null,
-        input: *const Input = undefined,
+        capture: ?*const Capture,
+        input: *const Input,
 
         fn getCapture(self: @This(), index: usize) ?*const Capture {
             var current = self.capture;
@@ -92,6 +86,12 @@ const Regex = union(enum) {
             if (self.capture) |c| return c.index + 1;
             return 0;
         }
+    };
+
+    const Capture = struct {
+        value: []const u8,
+        index: usize,
+        parent: ?*const Capture,
     };
 
     const Input = struct {
@@ -146,28 +146,32 @@ const Regex = union(enum) {
         var state: SearchState = .{
             .captures = .{},
         };
+        return self.match(allocator, state);
     }
+
+    // TODO:
+    // const match_iter = re.searchAll();
+    // defer match_iter.deinit();
 
     fn handleConcat(
         allocator: Allocator,
-        input_arg: Input,
         state_arg: SearchState,
         args: []const RE,
     ) !?Match {
-        if (args.len == 0) return .{ .pos = input_arg.pos, .len = 0 };
+        if (args.len == 0) return .{ .pos = state_arg.input.pos, .len = 0 };
 
         var i: usize = 0;
-        var input = input_arg;
-        var result: Match = .{ .pos = input_arg.pos, .len = 0 };
+        var state = state_arg;
+        var result: Match = .{ .pos = state.input.pos, .len = 0 };
 
         loop: while (i < args.len) : (i += 1) {
             const re = args[i];
             switch (re.*) {
                 ._repetition, ._capture => break :loop,
                 else => {
-                    const m = try re.match(allocator, input, state_arg) orelse return null;
+                    const m = try re.match(allocator, state) orelse return null;
                     result.len += m.len;
-                    input = input.slice(m.len);
+                    state = state.withInput(&state.input.slice(m.len));
                 },
             }
         }
@@ -179,17 +183,17 @@ const Regex = union(enum) {
         const rest_args = args[i + 1 ..];
         switch (args[i].*) {
             ._repetition => {
-                var iterator: Iterator = .init(args[i], input, state_arg);
+                var iterator: Iterator = .init(args[i], state);
                 defer iterator.deinit(allocator);
 
                 while (try iterator.next(allocator)) |m| {
-                    const rest_input = input.slice(m.len);
                     if (rest_args.len == 0) return .{
                         .pos = result.pos,
                         .len = result.len + m.len,
                     };
 
-                    if (try handleConcat(allocator, rest_input, state_arg, rest_args)) |m2| {
+                    const sub_state = state.withInput(&state.input.slice(m.len));
+                    if (try handleConcat(allocator, sub_state, rest_args)) |m2| {
                         return .{
                             .pos = result.pos,
                             .len = result.len + m.len + m2.len,
@@ -198,15 +202,17 @@ const Regex = union(enum) {
                 }
             },
             ._capture => |re| {
-                const m = try re.match(allocator, input, state_arg) orelse return null;
-                const rest_input = input.slice(m.len);
-                const sub_state = state_arg.withCapture(&.{
-                    .value = m.string(input.value),
-                    .index = if (state_arg.capture) |c| c.index + 1 else 0,
-                    .parent = state_arg.capture,
-                });
+                const m = try re.match(allocator, state) orelse return null;
+                const sub_state: SearchState = .{
+                    .capture = &.{
+                        .value = m.string(state.input.value),
+                        .index = if (state.capture) |c| c.index + 1 else 0,
+                        .parent = state.capture,
+                    },
+                    .input = &state.input.slice(m.len),
+                };
 
-                if (try handleConcat(allocator, rest_input, sub_state, rest_args)) |m2| {
+                if (try handleConcat(allocator, sub_state, rest_args)) |m2| {
                     return .{
                         .pos = result.pos,
                         .len = result.len + m.len + m2.len,
@@ -301,7 +307,8 @@ const Regex = union(enum) {
         return null;
     }
 
-    fn match(self: Self, allocator: Allocator, input_arg: Input, state: SearchState) Allocator.Error!?Match {
+    fn match(self: Self, allocator: Allocator, state: SearchState) Allocator.Error!?Match {
+        const input_arg = state.input;
         const match_one: Match = .{ .pos = input_arg.pos, .len = 1 };
         const match_zero: Match = .{ .pos = input_arg.pos, .len = 0 };
 
@@ -333,9 +340,10 @@ const Regex = union(enum) {
                     return null;
             },
 
+            // TODO: needs backtracking too, add iterator
             ._alt => |args| {
                 for (args) |re| {
-                    if (try re.match(allocator, input_arg, state)) |m| {
+                    if (try re.match(allocator, state)) |m| {
                         return m;
                     }
                 }
@@ -357,12 +365,12 @@ const Regex = union(enum) {
                 // Captures are only done under concats.
                 // If it got here it means it's outside of concat,
                 // so just match normally without capturing.
-                return try re.match(allocator, input_arg, state);
+                return try re.match(allocator, state);
             },
 
-            ._repetition => handleConcat(allocator, input_arg, state, &.{&self}),
+            ._repetition => handleConcat(allocator, state, &.{&self}),
 
-            ._concat => |args| handleConcat(allocator, input_arg, state, args),
+            ._concat => |args| handleConcat(allocator, state, args),
 
             inline .any,
             .word,
@@ -608,7 +616,6 @@ const Regex = union(enum) {
 const LazyIterator = struct {
     re: Regex.RE,
     state: Regex.SearchState,
-    input: Regex.Input,
     pos: usize = 0,
     len: usize = 0,
     iterations: usize = 0,
@@ -622,14 +629,14 @@ const LazyIterator = struct {
 
     fn next(self: *Self, allocator: Allocator) !?Regex.Match {
         const state = self.state;
-        var input = self.input;
+        var input = state.input;
 
         if (self.first) {
             self.first = false;
 
             // skip first few matches until min
             while (self.iterations < self.min) {
-                if (try self.re.match(allocator, input, state)) |m| {
+                if (try self.re.match(allocator, state)) |m| {
                     self.pos = m.pos;
                     self.len = m.len;
                     self.iterations += 1;
@@ -642,7 +649,8 @@ const LazyIterator = struct {
         const max = self.max orelse std.math.maxInt(usize);
 
         if (self.iterations <= max) {
-            if (try self.re.match(allocator, input.slice(self.len), state)) |m| {
+            const sub_state = state.withInput(&input.slice(self.len));
+            if (try self.re.match(allocator, sub_state)) |m| {
                 self.len += m.len;
                 self.iterations += 1;
                 return .{ .pos = self.pos, .len = self.len };
@@ -664,7 +672,6 @@ const LazyIterator = struct {
 const GreedyIterator = struct {
     re: Regex.RE,
     state: Regex.SearchState,
-    input: Regex.Input,
     pos: usize = 0,
     len: usize = 0,
     min: usize,
@@ -685,12 +692,12 @@ const GreedyIterator = struct {
             self.first = false;
 
             var n: usize = 0;
-            var input = self.input;
+            var input = self.state.input;
             var lengths = &self.lengths;
 
             // skip first few matches until min
             while (n < self.min) {
-                if (try self.re.match(allocator, input, state)) |m| {
+                if (try self.re.match(allocator, state)) |m| {
                     self.pos = m.pos;
                     n += 1;
                 } else return null;
@@ -702,8 +709,7 @@ const GreedyIterator = struct {
                 if (self.max) |max| {
                     if (lengths.items.len >= max) break;
                 }
-
-                if (try self.re.match(allocator, input.slice(self.len), state)) |m| {
+                if (try self.re.match(allocator, state.withInput(&input.slice(self.len)))) |m| {
                     self.len += m.len;
                     if (lengths.items.len == 0) self.pos = m.pos;
                     try lengths.append(allocator, self.len);
@@ -723,7 +729,6 @@ const GreedyIterator = struct {
 const SingleIterator = struct {
     re: Regex.RE,
     state: Regex.SearchState,
-    input: Regex.Input,
     pos: usize = 0,
     len: usize = 0,
     first: bool = true,
@@ -735,7 +740,7 @@ const SingleIterator = struct {
     fn next(self: *Self, allocator: Allocator) !?Regex.Match {
         if (self.first) {
             self.first = false;
-            const result = try self.re.match(allocator, self.input, self.state);
+            const result = try self.re.match(allocator, self.state);
             if (result) |m| {
                 self.pos = m.pos;
                 self.len = m.len;
@@ -755,27 +760,23 @@ const Iterator = union(enum) {
 
     fn init(
         re: Regex.RE,
-        input: Regex.Input,
         state: Regex.SearchState,
     ) Self {
         return switch (re.*) {
             ._repetition => |val| if (val.greedy) .{ .greedy = GreedyIterator{
                 .re = val.re,
                 .state = state,
-                .input = input,
                 .min = val.min,
                 .max = val.max,
             } } else .{ .lazy = LazyIterator{
                 .re = val.re,
                 .state = state,
-                .input = input,
                 .min = val.min,
                 .max = val.max,
             } },
             else => .{ .single = .{
                 .re = re,
                 .state = state,
-                .input = input,
             } },
         };
     }
