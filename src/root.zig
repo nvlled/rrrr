@@ -192,6 +192,9 @@ const Regex = union(enum) {
     };
 
     fn getLiteralPrefix(self: RE) ?[]const u8 {
+        // TODO: an empty string is returned to stop searching
+        // since returning null would proceed to search the
+        // rest of the re tree. There's probably a better way to do that.
         return switch (self.*) {
             ._literal => |val| val,
             ._concat => |args| {
@@ -206,7 +209,8 @@ const Regex = union(enum) {
                 if (getLiteralPrefix(val.re)) |prefix| return prefix;
                 return null;
             },
-            else => return null,
+            ._alt => "",
+            else => null,
         };
     }
 
@@ -241,7 +245,7 @@ const Regex = union(enum) {
         loop: while (i < args.len) : (i += 1) {
             const re = args[i];
             switch (re.*) {
-                ._repetition, ._capture => break :loop,
+                ._repetition, ._alt, ._capture => break :loop,
                 else => {
                     const m = try re.match(allocator, state) orelse return null;
                     result.len += m.len;
@@ -256,7 +260,7 @@ const Regex = union(enum) {
 
         const rest_args = args[i + 1 ..];
         switch (args[i].*) {
-            ._repetition => {
+            ._repetition, ._alt => {
                 var iterator: Iterator = .init(args[i], state);
                 defer iterator.deinit(allocator);
 
@@ -281,7 +285,6 @@ const Regex = union(enum) {
                     .capture = .{
                         .value = m.string(state.input.value),
                         .index = if (state.capture) |c| c.index + 1 else 0,
-                        // does this do what I think it does?
                         .parent = if (state.capture) |*c| c else null,
                     },
                     .input = state.input.slice(m.len),
@@ -415,7 +418,6 @@ const Regex = union(enum) {
                     return null;
             },
 
-            // TODO: needs backtracking too, add iterator
             ._alt => |args| {
                 for (args) |re| {
                     if (try re.match(allocator, state)) |m| {
@@ -799,11 +801,32 @@ const GreedyIterator = struct {
     }
 };
 
+const AlternationIterator = struct {
+    choices: []const Regex.RE,
+    state: Regex.SearchState,
+    index: usize = 0,
+
+    const Self = @This();
+
+    fn deinit(_: *Self, _: Allocator) void {}
+
+    fn next(self: *Self, allocator: Allocator) !?Regex.Match {
+        while (self.index < self.choices.len) {
+            defer self.index += 1;
+            const re = self.choices[self.index];
+
+            if (try re.match(allocator, self.state)) |m| {
+                return m;
+            }
+        }
+
+        return null;
+    }
+};
+
 const SingleIterator = struct {
     re: Regex.RE,
     state: Regex.SearchState,
-    pos: usize = 0,
-    len: usize = 0,
     first: bool = true,
 
     const Self = @This();
@@ -813,12 +836,7 @@ const SingleIterator = struct {
     fn next(self: *Self, allocator: Allocator) !?Regex.Match {
         if (self.first) {
             self.first = false;
-            const result = try self.re.match(allocator, self.state);
-            if (result) |m| {
-                self.pos = m.pos;
-                self.len = m.len;
-            }
-            return result;
+            return try self.re.match(allocator, self.state);
         }
         return null;
     }
@@ -827,6 +845,7 @@ const SingleIterator = struct {
 const Iterator = union(enum) {
     greedy: GreedyIterator,
     lazy: LazyIterator,
+    alternation: AlternationIterator,
     single: SingleIterator,
 
     const Self = @This();
@@ -836,21 +855,35 @@ const Iterator = union(enum) {
         state: Regex.SearchState,
     ) Self {
         return switch (re.*) {
-            ._repetition => |val| if (val.greedy) .{ .greedy = GreedyIterator{
-                .re = val.re,
-                .state = state,
-                .min = val.min,
-                .max = val.max,
-            } } else .{ .lazy = LazyIterator{
-                .re = val.re,
-                .state = state,
-                .min = val.min,
-                .max = val.max,
-            } },
-            else => .{ .single = .{
-                .re = re,
-                .state = state,
-            } },
+            ._repetition => |val| {
+                return if (val.greedy) .{
+                    .greedy = GreedyIterator{
+                        .re = val.re,
+                        .state = state,
+                        .min = val.min,
+                        .max = val.max,
+                    },
+                } else .{
+                    .lazy = LazyIterator{
+                        .re = val.re,
+                        .state = state,
+                        .min = val.min,
+                        .max = val.max,
+                    },
+                };
+            },
+            ._alt => |args| .{
+                .alternation = .{
+                    .choices = args,
+                    .state = state,
+                },
+            },
+            else => .{
+                .single = .{
+                    .re = re,
+                    .state = state,
+                },
+            },
         };
     }
 
@@ -1146,6 +1179,51 @@ test {
             .input = "aaaaabcefg",
             .expected = "abc",
         },
+        .{
+            .re = &.concat(&.{
+                &.oneOrMore(&.literal("abc")),
+                &.either(&.{
+                    &.literal("xyz"),
+                    &.literal("qw"),
+                    &.literal("ert"),
+                }),
+                &.either(&.{
+                    &.literal("g"),
+                    &.literal("q"),
+                }),
+            }),
+            .input = "81293abcabcxyzqq",
+            .expected = "abcabcxyzq",
+        },
+        .{
+            .re = &.concat(&.{
+                &.oneOrMore(&.literal("abc")),
+                &.either(&.{
+                    &.literal("xyz"),
+                    &.literal("qw"),
+                    &.literal("ert"),
+                }),
+                &.either(&.{
+                    &.literal("aa"),
+                    &.literal("bb"),
+                    &.literal("cc"),
+                }),
+            }),
+            .input = "898493abcabcertaa1298312",
+            .expected = "abcabcertaa",
+        },
+        .{
+            .re = &.concat(&.{
+                &.either(&.{
+                    &.literal("aa"),
+                    &.literal("aaa"),
+                    &.literal("a"),
+                }),
+                &.literal("aab"),
+            }),
+            .input = "aaab",
+            .expected = "aaab",
+        },
     };
 
     for (tests) |item| {
@@ -1201,6 +1279,7 @@ test "match iterator" {
 //   - atLeast(2, any) -> concat(any, any, zeroOrMore(any))
 // - extract common either cases
 //   - either("xyz", "xyyy", "xxx") -> concat("x", either("yz", "yyy", "xx"))
+// - either with one elem -> remove either
 // - combine either charsets
 // - if either contains only literals, use a hashmap
 // - use a non-allocating iterator for literal repetitions
