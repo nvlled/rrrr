@@ -1,6 +1,7 @@
 const std = @import("std");
 const BitSet = std.bit_set.IntegerBitSet(256);
 const Allocator = std.mem.Allocator;
+const ArrayList = std.ArrayListUnmanaged;
 
 const Regex = union(enum) {
     const Self = @This();
@@ -608,6 +609,230 @@ const Regex = union(enum) {
     fn capture(re: RE) Self {
         return .{ ._capture = re };
     }
+
+    // Caller should free the returned string
+    fn repeatString(allocator: Allocator, count: usize, str: []const u8) ![]const u8 {
+        var buf: ArrayList(u8) = try .initCapacity(allocator, count * str.len);
+        var i: usize = 0;
+        while (i < buf.items.len) : (i += str.len) {
+            @memcpy(buf.items[i..str.len], str);
+        }
+        return buf.toOwnedSlice(allocator);
+    }
+
+    fn repeat(self: RE, allocator: Allocator, count: usize) ![]const RE {
+        var buf: ArrayList(RE) = try .initCapacity(allocator, count);
+        for (0..count) |_| {
+            try buf.append(allocator, try self.dupe(allocator));
+        }
+        return buf.toOwnedSlice(allocator);
+    }
+
+    // TODO: re.normalize(allocator) for optimization
+    // / combine adjacent literals into a single literal
+    //   - if all concat args is all literal, convert concat to single literal
+    // / flatten nested concats
+    // / expand min repetition (if min is not too large)
+    //   / atLeast(2, "foo") -> concat("foofoo", zeroOrMore("foo"))
+    //   / atLeast(2, any) -> concat(any, any, zeroOrMore(any))
+    // - extract common either cases
+    //   - either("xyz", "xyyy", "xxx") -> concat("x", either("yz", "yyy", "xx"))
+    // - either with one elem -> remove either
+    // - combine either charsets
+    // - if either contains only literals, use a hashmap
+    //   - this will need to store the size of each key though
+    //     hash.contains(input[0..size]) for each key size
+    // - use a non-allocating iterator for literal repetitions
+
+    // Caller must recursively free the returned pointer afterwards,
+    // either manually or use re.recursiveFree(allocator)
+    fn normalize(re: RE, allocator: Allocator) !RE {
+        switch (re.*) {
+
+            // TODO: test
+            ._repetition => |val| {
+                const n = try val.re.normalize(allocator);
+                defer n.recursiveFree(allocator);
+
+                if (val.min == 0) return try re.dupe(allocator);
+
+                switch (n.*) {
+                    ._literal => {
+                        const str = try repeatString(allocator, val.min, n._literal);
+                        return try Regex.concat(&.{
+                            &.literal(str),
+                            &.zeroOrMore(n),
+                        }).dupe(allocator);
+                    },
+                    else => {
+                        //var args: ArrayList(RE) = try .initCapacity(allocator, val.min + 1);
+                        //for (0..val.min) |_| {
+                        //    try args.append(allocator, try n.dupe(allocator));
+                        //}
+                        //try args.append(allocator, try Regex.zeroOrMore(n).dupe(allocator));
+                        //return try Regex.concat(
+                        //    try args.toOwnedSlice(allocator),
+                        //).dupe(allocator);
+
+                        const repeated = try n.repeat(allocator, val.min);
+                        return Regex.concat(&.{
+                            &.concat(repeated),
+                            &.zeroOrMore(re),
+                        }).normalize(allocator);
+                    },
+                }
+            },
+            ._concat => |args| {
+                if (args.len == 0) return re;
+
+                var normalized_args: ArrayList(RE) = try .initCapacity(allocator, args.len);
+                for (args) |arg| {
+                    try normalized_args.append(allocator, try normalize(arg, allocator));
+                }
+                errdefer normalized_args.deinit(allocator);
+
+                var flattened: ArrayList(RE) = try flattenConcat(normalized_args.items, allocator);
+                defer flattened.deinit(allocator);
+                normalized_args.deinit(allocator);
+
+                var combined: ArrayList(RE) = try .initCapacity(allocator, flattened.items.len);
+                defer combined.deinit(allocator);
+
+                var i: usize = 0;
+                while (i < flattened.items.len) {
+                    const current = flattened.items[i];
+                    if (current.* != ._literal) {
+                        try combined.append(allocator, current);
+                        i += 1;
+                        continue;
+                    }
+
+                    var j: usize = i + 1;
+                    while (j < flattened.items.len and flattened.items[j].* == ._literal) {
+                        j += 1;
+                    }
+
+                    const lit = try concatLiterals(allocator, flattened.items[i..j]);
+                    try combined.append(allocator, lit);
+
+                    for (i..j) |index| {
+                        const re2 = flattened.items[index];
+                        allocator.free(re2._literal);
+                        allocator.destroy(re2);
+                    }
+
+                    i = j;
+                }
+
+                if (combined.items.len == 1) {
+                    const first = combined.items[0];
+                    return first;
+                }
+
+                const result = try allocator.create(Self);
+                result.* = .concat(try combined.toOwnedSlice(allocator));
+                return result;
+            },
+            ._literal => |str| {
+                const str_copy = try allocator.dupe(u8, str);
+                return try Regex.literal(str_copy).dupe(allocator);
+            },
+            else => {
+                // Since the caller is meant to free whatever is returned from normalize()
+                // it makes sense to always copy and allocate, regardless of
+                // whether re is changed or not.
+                // Unless I could wrap the result to add a flag whether it should
+                // be freed? That sounds more complicated though.
+                return try re.recursiveCopy(allocator);
+            },
+        }
+    }
+
+    fn concatLiterals(allocator: Allocator, args: []const RE) !RE {
+        var size: usize = 0;
+        for (args) |arg| {
+            switch (arg.*) {
+                ._literal => |s| size += s.len,
+                else => unreachable,
+            }
+        }
+        var str: ArrayList(u8) = try .initCapacity(allocator, size);
+        for (args) |arg| {
+            try str.appendSlice(allocator, arg._literal);
+        }
+        return try Regex.literal(try str.toOwnedSlice(allocator)).dupe(allocator);
+    }
+
+    // shallow duplicate
+    fn dupe(self: RE, allocator: Allocator) !RE {
+        const copy = try allocator.create(Regex);
+        copy.* = self.*;
+        return copy;
+    }
+
+    fn recursiveCopy(self: RE, allocator: Allocator) !RE {
+        const result: Regex = balake: switch (self.*) {
+            // hmmm, should I copy the string too?
+            // I think most of the time that's not what I want
+            // because that would lead to excessive copying
+            ._literal => |str| break :balake .literal(try allocator.dupe(u8, str)),
+
+            ._concat => |args| {
+                var args_buf: ArrayList(RE) = try .initCapacity(allocator, args.len);
+                for (args) |arg| {
+                    const arg_copy = try arg.recursiveCopy(allocator);
+                    try args_buf.append(allocator, arg_copy);
+                }
+                break :balake .concat(try args_buf.toOwnedSlice(allocator));
+            },
+
+            ._alt => |args| {
+                var args_buf: ArrayList(RE) = try .initCapacity(allocator, args.len);
+                for (args) |arg| {
+                    const arg_copy = try arg.recursiveCopy(allocator);
+                    try args_buf.append(allocator, arg_copy);
+                }
+                break :balake .either(try args_buf.toOwnedSlice(allocator));
+            },
+
+            .any => break :balake self.*,
+
+            else => @panic("TODO"),
+        };
+        return result.dupe(allocator);
+    }
+
+    fn recursiveFree(self: RE, allocator: Allocator) void {
+        switch (self.*) {
+            ._literal => |str| {
+                allocator.free(str);
+                allocator.destroy(self);
+            },
+            ._concat => |args| {
+                for (args) |sub_re| sub_re.recursiveFree(allocator);
+                allocator.free(args);
+                allocator.destroy(self);
+            },
+            .any => {
+                allocator.destroy(self);
+            },
+            else => @panic("TODO"),
+        }
+    }
+
+    // no regex copies will be made
+    fn flattenConcat(args: []const RE, allocator: Allocator) !ArrayList(RE) {
+        // assumes each concat in args is already flattened
+        // so no need to do this recursively
+        var result: ArrayList(RE) = try .initCapacity(allocator, args.len);
+        for (args) |re| {
+            switch (re.*) {
+                ._concat => |items| try result.appendSlice(allocator, items),
+                else => try result.append(allocator, re),
+            }
+        }
+        return result;
+    }
 };
 
 const LazyIterator = struct {
@@ -1187,21 +1412,42 @@ test "match iterator" {
     }
 }
 
-// TODO: re.normalize(allocator) for optimization
-// - combine adjacent literals into a single literal
-//   - if all concat args is all literal, convert concat to single literal
-// - flatten nested concats
-// - expand char ranges into literal
-// - replace backrefs of captured literals with literals
-//   - not very useful since captures are done on character sets
-// - expand min repetition (if min is not too large)
-//   - atLeast(2, "foo") -> concat("foofoo", zeroOrMore("foo"))
-//   - atLeast(2, any) -> concat(any, any, zeroOrMore(any))
-// - extract common either cases
-//   - either("xyz", "xyyy", "xxx") -> concat("x", either("yz", "yyy", "xx"))
-// - either with one elem -> remove either
-// - combine either charsets
-// - if either contains only literals, use a hashmap
-// - use a non-allocating iterator for literal repetitions
+test "normalize concat 1" {
+    const re: Regex.RE = &.concat(&.{
+        &.literal("abc"),
+        &.literal("def"),
+        &.concat(&.{
+            &.literal("ghi"),
+        }),
+        &.concat(&.{
+            &.concat(&.{
+                &.literal("jkl"),
+            }),
+        }),
+    });
 
-// .atLeastOne(.either("abc", "y"))
+    const allocator = std.testing.allocator;
+    const n = try re.normalize(allocator);
+    defer n.recursiveFree(allocator);
+
+    try std.testing.expectEqualStrings("abcdefghijkl", n._literal);
+}
+
+test "normalize concat 2" {
+    const re: Regex.RE = &.concat(&.{
+        &.literal("abc"),
+        &.literal("def"),
+        &.any,
+        &.literal("ghi"),
+        &.literal("jkl"),
+    });
+
+    const allocator = std.testing.allocator;
+    const n = try re.normalize(allocator);
+    defer n.recursiveFree(allocator);
+
+    try std.testing.expect(n.* == ._concat);
+    try std.testing.expectEqualStrings("abcdef", n._concat[0]._literal);
+    try std.testing.expectEqual(.any, n._concat[1].*);
+    try std.testing.expectEqualStrings("ghijkl", n._concat[2]._literal);
+}
