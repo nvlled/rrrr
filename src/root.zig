@@ -172,19 +172,21 @@ const Regex = union(enum) {
         fn next(self: *@This(), allocator: Allocator) Allocator.Error!?Match {
             const re = self.re;
 
-            while (self.state.input.hasMore()) {
-                const input = self.state.input;
+            var input = &self.state.input;
+            while (input.hasMore()) {
                 if (self.prefix) |prefix| {
-                    self.state.input.pos = std.mem.indexOfPos(u8, input.value, input.pos, prefix) orelse {
+                    const pos = std.mem.indexOfPos(u8, input.value, input.pos, prefix) orelse {
+                        input.pos = input.value.len; // set to end
                         return null;
                     };
+                    input.pos = pos;
                 }
 
                 if (try re.match(allocator, self.state)) |m| {
                     self.state.input = self.state.input.slice(m.len);
                     return m;
                 }
-                self.state.input.pos += 1;
+                input.pos += 1;
             }
 
             return null;
@@ -298,88 +300,6 @@ const Regex = union(enum) {
                 }
             },
             else => unreachable,
-        }
-
-        return null;
-    }
-
-    // TODO: remove
-    fn handleConcatIterative(
-        allocator: Allocator,
-        input: []const u8,
-        state: *SearchState,
-        args: []const RE,
-    ) !?Match {
-        const size = state.capture.items.len;
-        defer state.capture.shrinkRetainingCapacity(size);
-
-        if (args.len == 0) return null;
-
-        var i: usize = 0;
-        var step_back = false;
-        var result: Match = .{ .pos = input.pos, .len = 0 };
-        var snapshot: std.ArrayListUnmanaged(struct {
-            match: Match,
-            iterator: Iterator,
-            arg_index: usize,
-            capture_size: usize,
-        }) = .{};
-
-        defer {
-            for (snapshot.items) |*elem| {
-                elem.iterator.deinit(allocator);
-            }
-            snapshot.deinit(allocator);
-        }
-
-        while (true) {
-            const re, const capture_result = switch (args[i].*) {
-                ._capture => |val| .{ val, true },
-                else => .{ args[i], false },
-            };
-
-            var iterator, const str = blk: switch (step_back) {
-                true => {
-                    const s = snapshot.pop() orelse break;
-                    const capture_size = s.capture_size;
-                    state.capture.shrinkRetainingCapacity(capture_size);
-
-                    i = s.arg_index;
-                    result = s.match;
-                    step_back = false;
-
-                    const str = input[result.pos + result.len ..];
-                    break :blk .{ s.iterator, str };
-                },
-                false => {
-                    const str = input[result.pos + result.len ..];
-                    const iterator: Iterator = .init(re, str, state);
-                    break :blk .{ iterator, str };
-                },
-            };
-            errdefer iterator.deinit(allocator);
-
-            const m = try iterator.next(allocator) orelse {
-                iterator.deinit(allocator);
-                step_back = true;
-                continue;
-            };
-
-            switch (iterator) {
-                .single => {},
-                else => try snapshot.append(allocator, .{
-                    .match = result,
-                    .iterator = iterator,
-                    .arg_index = i,
-                    .capture_size = state.capture.items.len,
-                }),
-            }
-
-            result.len += m.len;
-            if (i == 0) result.pos = m.pos;
-            if (i >= args.len - 1) return result;
-            if (capture_result) try state.capture.append(allocator, m.value(str));
-            i += 1;
         }
 
         return null;
