@@ -612,10 +612,13 @@ const Regex = union(enum) {
 
     // Caller should free the returned string
     fn repeatString(allocator: Allocator, count: usize, str: []const u8) ![]const u8 {
-        var buf: ArrayList(u8) = try .initCapacity(allocator, count * str.len);
+        const len = count * str.len;
+        var buf: ArrayList(u8) = try .initCapacity(allocator, len);
+        errdefer buf.deinit(allocator);
+
         var i: usize = 0;
-        while (i < buf.items.len) : (i += str.len) {
-            @memcpy(buf.items[i..str.len], str);
+        while (i < len) : (i += str.len) {
+            try buf.appendSlice(allocator, str);
         }
         return buf.toOwnedSlice(allocator);
     }
@@ -648,36 +651,29 @@ const Regex = union(enum) {
     // either manually or use re.recursiveFree(allocator)
     fn normalize(re: RE, allocator: Allocator) !RE {
         switch (re.*) {
-
-            // TODO: test
             ._repetition => |val| {
+                if (val.min == 0) return try re.recursiveCopy(allocator);
+
                 const n = try val.re.normalize(allocator);
                 defer n.recursiveFree(allocator);
-
-                if (val.min == 0) return try re.dupe(allocator);
 
                 switch (n.*) {
                     ._literal => {
                         const str = try repeatString(allocator, val.min, n._literal);
+                        defer allocator.free(str);
+
                         return try Regex.concat(&.{
                             &.literal(str),
                             &.zeroOrMore(n),
-                        }).dupe(allocator);
+                        }).recursiveCopy(allocator);
                     },
                     else => {
-                        //var args: ArrayList(RE) = try .initCapacity(allocator, val.min + 1);
-                        //for (0..val.min) |_| {
-                        //    try args.append(allocator, try n.dupe(allocator));
-                        //}
-                        //try args.append(allocator, try Regex.zeroOrMore(n).dupe(allocator));
-                        //return try Regex.concat(
-                        //    try args.toOwnedSlice(allocator),
-                        //).dupe(allocator);
-
                         const repeated = try n.repeat(allocator, val.min);
+                        errdefer allocator.free(repeated);
+
                         return Regex.concat(&.{
                             &.concat(repeated),
-                            &.zeroOrMore(re),
+                            &.zeroOrMore(n),
                         }).normalize(allocator);
                     },
                 }
@@ -686,19 +682,30 @@ const Regex = union(enum) {
                 if (args.len == 0) return re;
 
                 var normalized_args: ArrayList(RE) = try .initCapacity(allocator, args.len);
+                errdefer normalized_args.deinit(allocator);
+
                 for (args) |arg| {
                     try normalized_args.append(allocator, try normalize(arg, allocator));
                 }
-                errdefer normalized_args.deinit(allocator);
 
-                var flattened: ArrayList(RE) = try flattenConcat(normalized_args.items, allocator);
+                var flattened: ArrayList(RE) = try flattenConcat(
+                    normalized_args.items,
+                    allocator,
+                );
                 defer flattened.deinit(allocator);
                 normalized_args.deinit(allocator);
 
+                var i: usize = 0;
                 var combined: ArrayList(RE) = try .initCapacity(allocator, flattened.items.len);
                 defer combined.deinit(allocator);
 
-                var i: usize = 0;
+                errdefer {
+                    for (combined.items) |item| item.recursiveFree(allocator);
+                    for (i..flattened.items.len) |index| {
+                        flattened.items[index].recursiveFree(allocator);
+                    }
+                }
+
                 while (i < flattened.items.len) {
                     const current = flattened.items[i];
                     if (current.* != ._literal) {
@@ -713,6 +720,8 @@ const Regex = union(enum) {
                     }
 
                     const lit = try concatLiterals(allocator, flattened.items[i..j]);
+                    errdefer lit.recursiveFree(allocator);
+
                     try combined.append(allocator, lit);
 
                     for (i..j) |index| {
@@ -729,9 +738,10 @@ const Regex = union(enum) {
                     return first;
                 }
 
-                const result = try allocator.create(Self);
-                result.* = .concat(try combined.toOwnedSlice(allocator));
-                return result;
+                const new_args = try combined.toOwnedSlice(allocator);
+                errdefer allocator.free(new_args);
+
+                return try Regex.concat(new_args).dupe(allocator);
             },
             ._literal => |str| {
                 const str_copy = try allocator.dupe(u8, str);
@@ -763,6 +773,7 @@ const Regex = union(enum) {
         return try Regex.literal(try str.toOwnedSlice(allocator)).dupe(allocator);
     }
 
+    // TODO: should be private
     // shallow duplicate
     fn dupe(self: RE, allocator: Allocator) !RE {
         const copy = try allocator.create(Regex);
@@ -772,52 +783,65 @@ const Regex = union(enum) {
 
     fn recursiveCopy(self: RE, allocator: Allocator) !RE {
         const result: Regex = balake: switch (self.*) {
-            // hmmm, should I copy the string too?
-            // I think most of the time that's not what I want
-            // because that would lead to excessive copying
             ._literal => |str| break :balake .literal(try allocator.dupe(u8, str)),
 
-            ._concat => |args| {
+            inline ._concat, ._alt => |args, t| {
                 var args_buf: ArrayList(RE) = try .initCapacity(allocator, args.len);
+                errdefer args_buf.deinit(allocator);
+
                 for (args) |arg| {
                     const arg_copy = try arg.recursiveCopy(allocator);
+                    errdefer arg_copy.recursiveFree(allocator);
                     try args_buf.append(allocator, arg_copy);
                 }
-                break :balake .concat(try args_buf.toOwnedSlice(allocator));
+
+                break :balake switch (t) {
+                    ._concat => .concat(try args_buf.toOwnedSlice(allocator)),
+                    ._alt => .either(try args_buf.toOwnedSlice(allocator)),
+                    else => comptime unreachable,
+                };
             },
 
-            ._alt => |args| {
-                var args_buf: ArrayList(RE) = try .initCapacity(allocator, args.len);
-                for (args) |arg| {
-                    const arg_copy = try arg.recursiveCopy(allocator);
-                    try args_buf.append(allocator, arg_copy);
-                }
-                break :balake .either(try args_buf.toOwnedSlice(allocator));
+            ._repetition => |val| {
+                const inner_re = try val.re.recursiveCopy(allocator);
+                errdefer inner_re.recursiveFree(allocator);
+
+                return (Regex{
+                    ._repetition = .{
+                        .re = inner_re,
+                        .min = val.min,
+                        .max = val.max,
+                        .greedy = val.greedy,
+                    },
+                }).dupe(allocator);
+            },
+            ._capture => |re| {
+                const copy = try re.recursiveCopy(allocator);
+                errdefer copy.recursiveFree(allocator);
+                return try Regex.capture(copy).dupe(allocator);
             },
 
-            .any => break :balake self.*,
-
-            else => @panic("TODO"),
+            // balake, not ey ey ron or jayquelin
+            else => break :balake self.*,
         };
+
+        errdefer result.recursiveFree(allocator);
         return result.dupe(allocator);
     }
 
     fn recursiveFree(self: RE, allocator: Allocator) void {
         switch (self.*) {
-            ._literal => |str| {
-                allocator.free(str);
-                allocator.destroy(self);
-            },
-            ._concat => |args| {
+            ._literal => |str| allocator.free(str),
+            ._repetition => |val| val.re.recursiveFree(allocator),
+            ._capture => |re| re.recursiveFree(allocator),
+            ._concat, ._alt => |args| {
                 for (args) |sub_re| sub_re.recursiveFree(allocator);
                 allocator.free(args);
-                allocator.destroy(self);
             },
-            .any => {
-                allocator.destroy(self);
-            },
-            else => @panic("TODO"),
+            else => {},
         }
+        std.debug.print("free: {*},{s}\n", .{ self, @tagName(self.*) });
+        allocator.destroy(self);
     }
 
     // no regex copies will be made
@@ -832,6 +856,55 @@ const Regex = union(enum) {
             }
         }
         return result;
+    }
+
+    fn equals(re1: RE, re2: RE) bool {
+        if (std.meta.activeTag(re1.*) != std.meta.activeTag(re2.*)) {
+            return false;
+        }
+
+        return switch (re1.*) {
+            ._literal => std.mem.eql(u8, re1._literal, re2._literal),
+            ._capture => return equals(re1._capture, re2._capture),
+            ._backref => re1._backref == re2._backref,
+
+            ._concat => {
+                const a = re1._concat;
+                const b = re2._concat;
+                if (a.len != b.len) return false;
+
+                for (0..a.len) |i| {
+                    if (!equals(
+                        a[i],
+                        b[i],
+                    )) return false;
+                }
+                return true;
+            },
+            ._alt => {
+                const a = re1._alt;
+                const b = re2._alt;
+                if (a.len != b.len) return false;
+
+                for (0..a.len) |i| {
+                    if (!equals(
+                        a[i],
+                        b[i],
+                    )) return false;
+                }
+                return true;
+            },
+            ._repetition => {
+                const a = re1._repetition;
+                const b = re2._repetition;
+                if (!equals(a.re, b.re)) return false;
+                return a.min == b.min and
+                    a.max == b.max and
+                    a.greedy == b.greedy;
+            },
+
+            else => true,
+        };
     }
 };
 
@@ -1044,6 +1117,8 @@ const Iterator = union(enum) {
         };
     }
 };
+
+const testing = std.testing;
 
 test {
     const TestItem = struct {
@@ -1372,7 +1447,7 @@ test {
     };
 
     for (tests) |item| {
-        const result = try item.re.search(std.testing.allocator, item.input);
+        const result = try item.re.search(testing.allocator, item.input);
         std.debug.print("input: {s}, expected: {s}, got: ", .{ item.input, item.expected orelse "<null>" });
         if (result) |m| {
             std.debug.print("{s}\n", .{m.string(item.input)});
@@ -1381,10 +1456,10 @@ test {
         }
 
         if (item.expected) |expected| {
-            try std.testing.expect(result != null);
-            try std.testing.expectEqualSlices(u8, expected, result.?.string(item.input));
+            try testing.expect(result != null);
+            try testing.expectEqualSlices(u8, expected, result.?.string(item.input));
         } else {
-            try std.testing.expect(result == null);
+            try testing.expect(result == null);
         }
     }
 }
@@ -1405,11 +1480,39 @@ test "match iterator" {
     var iterator = re.searchAll(source);
 
     var i: usize = 0;
-    while (try iterator.next(std.testing.allocator)) |m| {
-        try std.testing.expect(i < expected.len);
-        try std.testing.expectEqualStrings(expected[i], m.string(source));
+    while (try iterator.next(testing.allocator)) |m| {
+        try testing.expect(i < expected.len);
+        try testing.expectEqualStrings(expected[i], m.string(source));
         i += 1;
     }
+}
+
+test "equality" {
+    const allocator = testing.allocator;
+
+    const re0: Regex.RE = &.literal("abc");
+    try testing.expect(re0.equals(re0));
+    try testing.expect(re0.equals(&.literal("abc")));
+    try testing.expect(!re0.equals(&.literal("xyz")));
+
+    const re1: Regex.RE = &.concat(&.{
+        &.literal("aaaa"),
+        &.either(&.{
+            &.literal("bbbb"),
+            &.capture(&.zeroOrMore(&.any)),
+        }),
+        &.any,
+    });
+    const re2 = try re1.recursiveCopy(testing.allocator);
+    defer re2.recursiveFree(allocator);
+
+    try testing.expect(re1.equals(re1));
+    try testing.expect(re1.equals(re2));
+    try testing.expect(re2.equals(re2));
+    try testing.expectEqualDeep(re1, re1);
+    try testing.expectEqualDeep(re1, re2);
+    try testing.expectEqualDeep(re2, re2);
+    try testing.expect(!re0.equals(re1));
 }
 
 test "normalize concat 1" {
@@ -1426,11 +1529,13 @@ test "normalize concat 1" {
         }),
     });
 
-    const allocator = std.testing.allocator;
-    const n = try re.normalize(allocator);
-    defer n.recursiveFree(allocator);
+    const allocator = testing.allocator;
+    const actual = try re.normalize(allocator);
+    defer actual.recursiveFree(allocator);
 
-    try std.testing.expectEqualStrings("abcdefghijkl", n._literal);
+    const expected: Regex.RE = &.literal("abcdefghijkl");
+    try testing.expectEqualDeep(expected, actual);
+    try testing.expect(expected.equals(actual));
 }
 
 test "normalize concat 2" {
@@ -1442,12 +1547,41 @@ test "normalize concat 2" {
         &.literal("jkl"),
     });
 
-    const allocator = std.testing.allocator;
-    const n = try re.normalize(allocator);
-    defer n.recursiveFree(allocator);
+    const allocator = testing.allocator;
+    const actual = try re.normalize(allocator);
+    defer actual.recursiveFree(allocator);
 
-    try std.testing.expect(n.* == ._concat);
-    try std.testing.expectEqualStrings("abcdef", n._concat[0]._literal);
-    try std.testing.expectEqual(.any, n._concat[1].*);
-    try std.testing.expectEqualStrings("ghijkl", n._concat[2]._literal);
+    const expected: Regex.RE = &.concat(&.{
+        &.literal("abcdef"),
+        &.any,
+        &.literal("ghijkl"),
+    });
+    try testing.expectEqualDeep(expected, actual);
+    try testing.expect(expected.equals(actual));
+}
+
+test "repetition 1" {
+    const allocator = testing.allocator;
+    const re: Regex.RE = &.atLeast(2, &.literal("abc"));
+
+    const actual = try re.normalize(allocator);
+    defer actual.recursiveFree(allocator);
+
+    const expected: Regex.RE = &.concat(&.{
+        &.literal("abcabc"),
+        &.zeroOrMore(&.literal("abc")),
+    });
+    try testing.expectEqualDeep(expected, actual);
+    try testing.expect(expected.equals(actual));
+}
+
+test "repetition 2" {
+    const allocator = testing.allocator;
+    const re: Regex.RE = &.zeroOrMore(&.literal("abc"));
+
+    const actual = try re.normalize(allocator);
+    defer actual.recursiveFree(allocator);
+
+    try testing.expectEqualDeep(re, actual);
+    try testing.expect(re.equals(actual));
 }
