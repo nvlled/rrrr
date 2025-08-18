@@ -415,7 +415,7 @@ const Regex = union(enum) {
     }
 
     fn replaceAll(
-        self: @This(),
+        self: Self,
         input: std.io.AnyWriter,
         output: std.io.AnyWriter,
     ) void {
@@ -639,37 +639,129 @@ const Regex = union(enum) {
     //   / atLeast(2, "foo") -> concat("foofoo", zeroOrMore("foo"))
     //   / atLeast(2, any) -> concat(any, any, zeroOrMore(any))
     // - extract common either cases
+    //   - either() -> never
+    //     - concat(never) -> never
+    //     This doesn't sound quite right
+    //     What's the zero value for or-operators?
+    //     Is it zero or one (true or false)?
+    //     1 or 1 = 1
+    //     1 or 0 = 1
+    //     0 or 1 = 1
+    //     0 or 0 = 0
+    //     This does look like an addition, so the zero value should be 0?
+    //
+    //   - either(either(a,b), either(c,d)) ==? either(a,b,c,d)
+    //   - either(a,a,a,a,b) == either(a,b)
     //   - either("xyz", "xyyy", "xxx") -> concat("x", either("yz", "yyy", "xx"))
+    //   - either("xyz", "xyyy", "") -> literal("")
+    //     this makes sense? even the regex tester confirms this
     // - either with one elem -> remove either
     // - combine either charsets
     // - if either contains only literals, use a hashmap
     //   - this will need to store the size of each key though
     //     hash.contains(input[0..size]) for each key size
+    //   - maybe not, hashmap is not easy to copy around
+    // - .any != literal("") ?
+    //   this isn't quite right, any consumes one character,
+    //   whereas literal("") doesn't
+    //   - concat("", "x", "y") ==? "xy"
+    // - .concat() == ""
+    //   - or more generally, re(never, ...) -> never
     // - use a non-allocating iterator for literal repetitions
+    //
+    // regex is surprinsingly algebraic, or mathy
+    // whatever that's called
 
     // Caller must recursively free the returned pointer afterwards,
     // either manually or use re.recursiveFree(allocator)
-    fn normalize(re: RE, allocator: Allocator) !RE {
+    fn normalize(re: RE, allocator: Allocator) Allocator.Error!RE {
+        // TODO: maybe call this function simplify instead?
+
         switch (re.*) {
+            ._alt => |args| {
+                if (args.len == 0) return re.recursiveCopy(allocator);
+
+                const nargs = try normalizeAll(allocator, args);
+                errdefer allocator.free(nargs);
+
+                const flattened = try flattenEither(nargs, allocator);
+                allocator.free(nargs);
+                defer {
+                    for (flattened) |item| {
+                        item.recursiveFree(allocator);
+                    }
+                    allocator.free(flattened);
+                }
+
+                for (flattened) |arg| {
+                    // make sure all arg is a literal
+                    if (arg.* != ._literal) return re.recursiveCopy(allocator);
+
+                    if (arg._literal.len == 0) {
+                        // an empty string matches anything
+                        // so simplify either("", ...) to a literal("")
+                        // TODO: actually, remove "" since TRUE or X == X
+                        return Regex.literal("").dupe(allocator);
+                    }
+                }
+
+                std.debug.assert(flattened.len > 0);
+                // at this point, every item is guaranteed to be non-empty literals
+
+                const first = flattened[0]._literal;
+
+                var i: usize = 0;
+                loop: while (i < flattened.len) : (i += 1) {
+                    for (flattened[1..]) |arg| {
+                        if (first[i] != arg._literal[i]) break :loop;
+                    }
+                }
+
+                if (i == 0) {
+                    // no common prefix found
+                    return re.recursiveCopy(allocator);
+                }
+
+                const common_prefix = try allocator.dupe(u8, first[0..i]);
+                errdefer allocator.free(common_prefix);
+
+                var new_args: ArrayList(RE) = try .initCapacity(allocator, flattened.len);
+                errdefer {
+                    for (new_args.items) |item| item.recursiveFree(allocator);
+                    new_args.deinit(allocator);
+                }
+
+                for (flattened) |item| {
+                    const str = try allocator.dupe(u8, item._literal[i..]);
+                    errdefer allocator.free(str);
+                    try new_args.append(allocator, try Regex.literal(str).dupe(allocator));
+                }
+
+                return try Regex.concat(try allocator.dupe(RE, &.{
+                    try Regex.literal(common_prefix).dupe(allocator),
+                    try Regex.either(new_args.items).dupe(allocator),
+                })).dupe(allocator);
+            },
+
             ._repetition => |val| {
                 if (val.min == 0) return re.recursiveCopy(allocator);
 
                 const n = try val.re.normalize(allocator);
-                defer n.recursiveFree(allocator);
+                errdefer n.recursiveFree(allocator);
 
                 switch (n.*) {
                     ._literal => {
                         const str = try repeatString(allocator, val.min, n._literal);
-                        defer allocator.free(str);
 
-                        return Regex.concat(&.{
-                            &.literal(str),
-                            &.zeroOrMore(n),
-                        }).recursiveCopy(allocator);
+                        return Regex.concat(try allocator.dupe(RE, &.{
+                            try Regex.literal(str).dupe(allocator),
+                            try Regex.zeroOrMore(n).dupe(allocator),
+                        })).dupe(allocator);
                     },
                     else => {
                         const repeated = try n.repeat(allocator, val.min);
                         errdefer allocator.free(repeated);
+                        n.recursiveFree(allocator);
 
                         return Regex.concat(&.{
                             &.concat(repeated),
@@ -679,35 +771,28 @@ const Regex = union(enum) {
                 }
             },
             ._concat => |args| {
-                if (args.len == 0) return re;
+                if (args.len == 0) return Regex.literal("").dupe(allocator);
 
-                var normalized_args: ArrayList(RE) = try .initCapacity(allocator, args.len);
-                errdefer normalized_args.deinit(allocator);
+                const nargs = try normalizeAll(allocator, args);
+                errdefer allocator.free(nargs);
 
-                for (args) |arg| {
-                    try normalized_args.append(allocator, try normalize(arg, allocator));
-                }
-
-                var flattened: ArrayList(RE) = try flattenConcat(
-                    normalized_args.items,
-                    allocator,
-                );
-                defer flattened.deinit(allocator);
-                normalized_args.deinit(allocator);
+                const flattened = try flattenConcat(nargs, allocator);
+                defer allocator.free(flattened);
+                allocator.free(nargs);
 
                 var i: usize = 0;
-                var combined: ArrayList(RE) = try .initCapacity(allocator, flattened.items.len);
+                var combined: ArrayList(RE) = try .initCapacity(allocator, flattened.len);
                 defer combined.deinit(allocator);
 
                 errdefer {
                     for (combined.items) |item| item.recursiveFree(allocator);
-                    for (i..flattened.items.len) |index| {
-                        flattened.items[index].recursiveFree(allocator);
+                    for (i..flattened.len) |index| {
+                        flattened[index].recursiveFree(allocator);
                     }
                 }
 
-                while (i < flattened.items.len) {
-                    const current = flattened.items[i];
+                while (i < flattened.len) {
+                    const current = flattened[i];
                     if (current.* != ._literal) {
                         try combined.append(allocator, current);
                         i += 1;
@@ -715,17 +800,17 @@ const Regex = union(enum) {
                     }
 
                     var j: usize = i + 1;
-                    while (j < flattened.items.len and flattened.items[j].* == ._literal) {
+                    while (j < flattened.len and flattened[j].* == ._literal) {
                         j += 1;
                     }
 
-                    const lit = try concatLiterals(allocator, flattened.items[i..j]);
+                    const lit = try concatLiterals(allocator, flattened[i..j]);
                     errdefer lit.recursiveFree(allocator);
 
                     try combined.append(allocator, lit);
 
                     for (i..j) |index| {
-                        const re2 = flattened.items[index];
+                        const re2 = flattened[index];
                         allocator.free(re2._literal);
                         allocator.destroy(re2);
                     }
@@ -743,9 +828,9 @@ const Regex = union(enum) {
 
                 return Regex.concat(new_args).dupe(allocator);
             },
-            ._literal => |str| {
-                const str_copy = try allocator.dupe(u8, str);
-                return Regex.literal(str_copy).dupe(allocator);
+            ._literal => |val| {
+                const str = try allocator.dupe(u8, val);
+                return Regex.literal(str).dupe(allocator);
             },
             else => {
                 // Since the caller is meant to free whatever is returned from normalize()
@@ -758,11 +843,22 @@ const Regex = union(enum) {
         }
     }
 
+    fn normalizeAll(allocator: Allocator, args: []const RE) Allocator.Error![]const RE {
+        var result: ArrayList(RE) = try .initCapacity(allocator, args.len);
+        errdefer result.deinit(allocator);
+
+        for (args) |arg| {
+            try result.append(allocator, try normalize(arg, allocator));
+        }
+
+        return result.toOwnedSlice(allocator);
+    }
+
     fn concatLiterals(allocator: Allocator, args: []const RE) !RE {
         var size: usize = 0;
         for (args) |arg| {
             switch (arg.*) {
-                ._literal => |s| size += s.len,
+                ._literal => |val| size += val.len,
                 else => unreachable,
             }
         }
@@ -783,7 +879,10 @@ const Regex = union(enum) {
 
     fn recursiveCopy(self: RE, allocator: Allocator) !RE {
         const result: Regex = balake: switch (self.*) {
-            ._literal => |str| break :balake .literal(try allocator.dupe(u8, str)),
+            ._literal => |val| {
+                const str = try allocator.dupe(u8, val);
+                break :balake .literal(str);
+            },
 
             inline ._concat, ._alt => |args, t| {
                 var args_buf: ArrayList(RE) = try .initCapacity(allocator, args.len);
@@ -831,7 +930,7 @@ const Regex = union(enum) {
 
     fn recursiveFree(self: RE, allocator: Allocator) void {
         switch (self.*) {
-            ._literal => |str| allocator.free(str),
+            ._literal => |val| allocator.free(val),
             ._repetition => |val| val.re.recursiveFree(allocator),
             ._capture => |re| re.recursiveFree(allocator),
             ._concat, ._alt => |args| {
@@ -840,12 +939,13 @@ const Regex = union(enum) {
             },
             else => {},
         }
-        std.debug.print("free: {*},{s}\n", .{ self, @tagName(self.*) });
         allocator.destroy(self);
     }
 
-    // no regex copies will be made
-    fn flattenConcat(args: []const RE, allocator: Allocator) !ArrayList(RE) {
+    // No regex copies will be made,
+    // so only the ArrayList should be free/deinit'ed,
+    // not the individual regexes.
+    fn flattenConcat(args: []const RE, allocator: Allocator) ![]const RE {
         // assumes each concat in args is already flattened
         // so no need to do this recursively
         var result: ArrayList(RE) = try .initCapacity(allocator, args.len);
@@ -855,7 +955,19 @@ const Regex = union(enum) {
                 else => try result.append(allocator, re),
             }
         }
-        return result;
+        return result.toOwnedSlice(allocator);
+    }
+
+    // same as flattenConcat but with either
+    fn flattenEither(args: []const RE, allocator: Allocator) ![]const RE {
+        var result: ArrayList(RE) = try .initCapacity(allocator, args.len);
+        for (args) |re| {
+            switch (re.*) {
+                ._alt => |items| try result.appendSlice(allocator, items),
+                else => try result.append(allocator, re),
+            }
+        }
+        return result.toOwnedSlice(allocator);
     }
 
     fn equals(re1: RE, re2: RE) bool {
@@ -963,6 +1075,13 @@ const LazyIterator = struct {
     }
 };
 
+// TODO: I could try wrapping an allocator
+// such that the OutOfMemory error is panic'ed instead
+// and not returned. That way, a lot of the allocating
+// code can be simplified and remove all the
+// error handling. This might go against zig philosophy
+// or whatnot, but OutOfMemory isn't something I need
+// to handle or recover in this case (or in general?)
 const GreedyIterator = struct {
     re: Regex.RE,
     state: Regex.SearchState,
@@ -1585,3 +1704,28 @@ test "repetition 2" {
     try testing.expectEqualDeep(re, actual);
     try testing.expect(re.equals(actual));
 }
+
+test "alternation 1" {
+    const allocator = testing.allocator;
+    const re: Regex.RE = &.either(&.{
+        &.literal("aabcdef"),
+        &.literal("aaaaa"),
+        &.literal("aaaxyz"),
+    });
+    const expected: Regex.RE = &.concat(&.{
+        &.literal("aa"),
+        &.either(&.{
+            &.literal("bcdef"),
+            &.literal("aaa"),
+            &.literal("axyz"),
+        }),
+    });
+
+    const actual = try re.normalize(allocator);
+    defer actual.recursiveFree(allocator);
+
+    try testing.expectEqualDeep(expected, actual);
+    try testing.expect(expected.equals(actual));
+}
+
+// TODO: re.serialize()
