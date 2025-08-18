@@ -363,7 +363,7 @@ const Regex = union(enum) {
                 // Captures are only done under concats.
                 // If it got here it means it's outside of concat,
                 // so just match normally without capturing.
-                return try re.match(allocator, state);
+                return re.match(allocator, state);
             },
 
             ._repetition => handleConcat(allocator, state, &.{&self}),
@@ -652,7 +652,7 @@ const Regex = union(enum) {
     fn normalize(re: RE, allocator: Allocator) !RE {
         switch (re.*) {
             ._repetition => |val| {
-                if (val.min == 0) return try re.recursiveCopy(allocator);
+                if (val.min == 0) return re.recursiveCopy(allocator);
 
                 const n = try val.re.normalize(allocator);
                 defer n.recursiveFree(allocator);
@@ -662,7 +662,7 @@ const Regex = union(enum) {
                         const str = try repeatString(allocator, val.min, n._literal);
                         defer allocator.free(str);
 
-                        return try Regex.concat(&.{
+                        return Regex.concat(&.{
                             &.literal(str),
                             &.zeroOrMore(n),
                         }).recursiveCopy(allocator);
@@ -741,11 +741,11 @@ const Regex = union(enum) {
                 const new_args = try combined.toOwnedSlice(allocator);
                 errdefer allocator.free(new_args);
 
-                return try Regex.concat(new_args).dupe(allocator);
+                return Regex.concat(new_args).dupe(allocator);
             },
             ._literal => |str| {
                 const str_copy = try allocator.dupe(u8, str);
-                return try Regex.literal(str_copy).dupe(allocator);
+                return Regex.literal(str_copy).dupe(allocator);
             },
             else => {
                 // Since the caller is meant to free whatever is returned from normalize()
@@ -753,7 +753,7 @@ const Regex = union(enum) {
                 // whether re is changed or not.
                 // Unless I could wrap the result to add a flag whether it should
                 // be freed? That sounds more complicated though.
-                return try re.recursiveCopy(allocator);
+                return re.recursiveCopy(allocator);
             },
         }
     }
@@ -770,7 +770,7 @@ const Regex = union(enum) {
         for (args) |arg| {
             try str.appendSlice(allocator, arg._literal);
         }
-        return try Regex.literal(try str.toOwnedSlice(allocator)).dupe(allocator);
+        return Regex.literal(try str.toOwnedSlice(allocator)).dupe(allocator);
     }
 
     // TODO: should be private
@@ -818,7 +818,7 @@ const Regex = union(enum) {
             ._capture => |re| {
                 const copy = try re.recursiveCopy(allocator);
                 errdefer copy.recursiveFree(allocator);
-                return try Regex.capture(copy).dupe(allocator);
+                return Regex.capture(copy).dupe(allocator);
             },
 
             // balake, not ey ey ron or jayquelin
@@ -1054,7 +1054,7 @@ const SingleIterator = struct {
     fn next(self: *Self, allocator: Allocator) !?Regex.Match {
         if (self.first) {
             self.first = false;
-            return try self.re.match(allocator, self.state);
+            return self.re.match(allocator, self.state);
         }
         return null;
     }
