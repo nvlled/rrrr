@@ -57,6 +57,7 @@ const Regex = union(enum) {
     boundary,
 
     any,
+    none,
     word,
     digit,
     alphabet,
@@ -666,6 +667,11 @@ const Regex = union(enum) {
     //   / atLeast(2, "foo") -> concat("foofoo", zeroOrMore("foo"))
     //   / atLeast(2, any) -> concat(any, any, zeroOrMore(any))
     // - extract common either cases
+    //    -either("abc", "abc") == literal("abc")
+    //    -== concat("abc", either(""))
+    //    -either("") is different from either()
+    //    -either("") == any
+    //    -either() == none
     //   - either() -> never
     //     - concat(never) -> never
     //     This doesn't sound quite right
@@ -706,12 +712,24 @@ const Regex = union(enum) {
 
         switch (re.*) {
             ._alt => |args| {
-                if (args.len == 0) return re.recursiveCopy(allocator);
+                if (args.len == 0) {
+                    const result: RE = &.none;
+                    return result.dupe(allocator);
+                }
 
                 const nargs = normalizeAll(allocator, args);
+                defer allocator.free(nargs);
 
-                const flattened = flattenEither(nargs, allocator);
-                allocator.free(nargs);
+                if (nargs.len == 0) {
+                    const result: RE = &.any;
+                    return result.dupe(allocator);
+                }
+
+                if (nargs.len == 1) {
+                    return nargs[0].recursiveCopy(allocator);
+                }
+
+                const flattened = flatten(._alt, nargs, allocator);
                 defer {
                     for (flattened) |item| {
                         item.recursiveFree(allocator);
@@ -720,75 +738,120 @@ const Regex = union(enum) {
                 }
 
                 for (flattened) |arg| {
-                    // make sure all arg is a literal
-                    if (arg.* != ._literal) return re.recursiveCopy(allocator);
-
-                    if (arg._literal.len == 0) {
-                        // an empty string matches anything
-                        // so simplify either("", ...) to a literal("")
-                        // TODO: actually, remove "" since TRUE or X == X
-                        return Regex.literal("").dupe(allocator);
+                    if (arg.* != ._literal) {
+                        // can't simplify further if one of the alternatives
+                        // is not a literal
+                        return Regex.either(flattened).recursiveCopy(allocator);
                     }
                 }
 
+                // flattened can't be empty since flattened.len >= nargs.len
+                // and nargs is not empty at this point
                 std.debug.assert(flattened.len > 0);
+
                 // at this point, every item is guaranteed to be non-empty literals
+                // since flatten excludes empty literals
 
                 const first = flattened[0]._literal;
 
                 var i: usize = 0;
-                loop: while (i < flattened.len) : (i += 1) {
+                loop: while (i < first.len) : (i += 1) {
                     for (flattened[1..]) |arg| {
+                        if (i >= arg._literal[i]) break :loop;
                         if (first[i] != arg._literal[i]) break :loop;
                     }
                 }
 
                 if (i == 0) {
                     // no common prefix found
-                    return re.recursiveCopy(allocator);
+                    return Regex.either(flattened).recursiveCopy(allocator);
                 }
 
-                const common_prefix = Alloc.@"try"(allocator.dupe(u8, first[0..i]));
+                const common_prefix = first[0..i];
 
-                var new_args = Alloc.@"try"(
+                var either_args: ArrayList(RE) = Alloc.@"try"(
                     ArrayList(RE).initCapacity(allocator, flattened.len),
                 );
+                defer either_args.deinit(allocator);
 
                 for (flattened) |item| {
-                    const str = Alloc.@"try"(allocator.dupe(u8, item._literal[i..]));
+                    const str = item._literal[i..];
+                    if (str.len == 0) continue;
+
+                    const str_copy = Alloc.@"try"(allocator.dupe(u8, str));
                     Alloc.@"try"(
-                        new_args.append(allocator, Regex.literal(str).dupe(allocator)),
+                        either_args.append(allocator, Regex.literal(str_copy).dupe(allocator)),
                     );
                 }
 
-                return Regex.concat(Alloc.@"try"(allocator.dupe(RE, &.{
-                    Regex.literal(common_prefix).dupe(allocator),
-                    Regex.either(new_args.items).dupe(allocator),
-                }))).dupe(allocator);
+                if (either_args.items.len == 0) {
+                    return Regex.literal(common_prefix).dupe(allocator);
+                }
+
+                const concat_args = &.{
+                    Regex.literal(
+                        Alloc.@"try"(allocator.dupe(u8, common_prefix)),
+                    ).dupe(allocator),
+                    Regex.either(
+                        Alloc.@"try"(either_args.toOwnedSlice(allocator)),
+                    ).dupe(allocator),
+                };
+
+                return Regex.concat(
+                    Alloc.@"try"(allocator.dupe(RE, concat_args)),
+                ).dupe(allocator);
             },
 
             ._repetition => |val| {
-                if (val.min == 0) return re.recursiveCopy(allocator);
+                var copy = val;
+                copy.re = val.re.normalize(allocator);
 
-                const n = val.re.normalize(allocator);
+                switch (copy.re.*) {
+                    // repeat(none) => none
+                    .none => return copy.re,
 
-                switch (n.*) {
                     ._literal => {
-                        const str = repeatString(allocator, val.min, n._literal);
+                        // repetition(literal"")) == literal("")
+                        if (copy.re._literal.len == 0) {
+                            copy.re.recursiveFree(allocator);
+                            return Regex.literal("").dupe(allocator);
+                        }
+
+                        if (val.min == 0) {
+                            // can't create a prefix if min is zero
+                            // so return as it is
+                            const result: RE = &.{ ._repetition = copy };
+                            return result.dupe(allocator);
+                        }
+
+                        const str = repeatString(allocator, val.min, copy.re._literal);
 
                         return Regex.concat(Alloc.@"try"(allocator.dupe(RE, &.{
                             Regex.literal(str).dupe(allocator),
-                            Regex.zeroOrMore(n).dupe(allocator),
+                            Regex.zeroOrMore(copy.re).dupe(allocator),
                         }))).dupe(allocator);
                     },
                     else => {
-                        const repeated = n.repeat(allocator, val.min);
-                        n.recursiveFree(allocator);
+                        if (val.min == 0) {
+                            const result: RE = &.{ ._repetition = copy };
+                            return result.dupe(allocator);
+                        }
 
-                        return Regex.concat(&.{
-                            &.concat(repeated),
-                            &.zeroOrMore(n),
-                        }).normalize(allocator);
+                        var args: ArrayList(RE) = Alloc.@"try"(
+                            ArrayList(RE).initCapacity(allocator, val.min + 1),
+                        );
+                        defer args.deinit(allocator);
+
+                        for (0..val.min) |_| Alloc.@"try"(
+                            args.append(allocator, copy.re.recursiveCopy(allocator)),
+                        );
+                        Alloc.@"try"(
+                            args.append(allocator, Regex.zeroOrMore(copy.re).dupe(allocator)),
+                        );
+
+                        return Regex.concat(
+                            Alloc.@"try"(args.toOwnedSlice(allocator)),
+                        ).dupe(allocator);
                     },
                 }
             },
@@ -796,8 +859,7 @@ const Regex = union(enum) {
                 if (args.len == 0) return Regex.literal("").dupe(allocator);
 
                 const nargs = normalizeAll(allocator, args);
-
-                const flattened = flattenConcat(nargs, allocator);
+                const flattened = flatten(._concat, nargs, allocator);
                 defer allocator.free(flattened);
                 allocator.free(nargs);
 
@@ -809,10 +871,20 @@ const Regex = union(enum) {
 
                 while (i < flattened.len) {
                     const current = flattened[i];
-                    if (current.* != ._literal) {
-                        Alloc.@"try"(combined.append(allocator, current));
-                        i += 1;
-                        continue;
+                    switch (current.*) {
+                        ._literal => {},
+                        .none => {
+                            // concat contains none, so it can't
+                            // match anything now, so simplify to none
+                            for (flattened) |item| item.recursiveFree(allocator);
+                            const result: RE = &.none;
+                            return result.dupe(allocator);
+                        },
+                        else => {
+                            Alloc.@"try"(combined.append(allocator, current));
+                            i += 1;
+                            continue;
+                        },
                     }
 
                     var j: usize = i + 1;
@@ -958,29 +1030,22 @@ const Regex = union(enum) {
     }
 
     // No regex copies will be made,
-    // so only the ArrayList should be free/deinit'ed,
-    // not the individual regexes.
-    fn flattenConcat(args: []const RE, allocator: Allocator) []const RE {
+    // so only the ArrayList should be free/deinit'ed, not the individual regexes.
+    // Empty literals are not included.
+    fn flatten(tag: anytype, args: []const RE, allocator: Allocator) []const RE {
         // assumes each concat in args is already flattened
         // so no need to do this recursively
         var result = Alloc.@"try"(ArrayList(RE).initCapacity(allocator, args.len));
 
         for (args) |re| {
             switch (re.*) {
-                ._concat => |items| Alloc.@"try"(result.appendSlice(allocator, items)),
-                else => Alloc.@"try"(result.append(allocator, re)),
-            }
-        }
-        return Alloc.@"try"(result.toOwnedSlice(allocator));
-    }
-
-    // same as flattenConcat but with either
-    fn flattenEither(args: []const RE, allocator: Allocator) []const RE {
-        var result = Alloc.@"try"(ArrayList(RE).initCapacity(allocator, args.len));
-
-        for (args) |re| {
-            switch (re.*) {
-                ._alt => |items| Alloc.@"try"(result.appendSlice(allocator, items)),
+                tag => |items| Alloc.@"try"(result.appendSlice(allocator, items)),
+                .none => {
+                    if (tag != ._either) Alloc.@"try"(result.append(allocator, re));
+                },
+                ._literal => |val| {
+                    if (val.len > 0) Alloc.@"try"(result.append(allocator, re));
+                },
                 else => Alloc.@"try"(result.append(allocator, re)),
             }
         }
@@ -1744,5 +1809,8 @@ test "alternation 1" {
     try testing.expectEqualDeep(expected, actual);
     try testing.expect(expected.equals(actual));
 }
+
+// TODO: test edge cases: empty string, one or zero either/concat args
+//       nested either() or concat
 
 // TODO: re.serialize()
