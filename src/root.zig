@@ -164,6 +164,9 @@ pub const Regex = union(enum) {
 
     back_reference: usize,
 
+    // TODO: these three should probably be flags instead
+    // along with captured
+    // Regex = struct { value: RE, pre: start|boundary, post: end|boundary, normalized: bool }
     start,
     end,
     boundary,
@@ -747,9 +750,8 @@ pub const Regex = union(enum) {
         return switch (self.*) {
             .literal_string => |val| val,
             .concatenation => |args| {
-                for (args) |re| {
-                    if (getLiteralPrefix(re)) |prefix| return prefix;
-                }
+                // check only first arg
+                if (args.len > 0) return getLiteralPrefix(args[0]);
                 return null;
             },
             .captured => |re| getLiteralPrefix(re),
@@ -888,41 +890,9 @@ const Simplifier = struct {
                     allocator.free(items);
                 }
 
-                for (items) |arg| {
-                    switch (arg.*) {
-                        .literal_string => {},
-
-                        // can't simplify further if one of the alternatives
-                        // is not a literal
-                        else => return Regex.either(items).recursiveCopy(allocator),
-                    }
-                }
-
-                // items can't be empty since items.len >= args.len
-                // and args is not empty at this point
-                std.debug.assert(items.len > 0);
-
-                // at this point, every item is guaranteed to be literals
-
-                const first = items[0].literal_string;
-
-                var i: usize = 0;
-                if (first.len > 0) {
-                    loop: while (i < first.len) : (i += 1) {
-                        for (items[1..]) |arg| {
-                            if (i >= arg.literal_string.len or
-                                first[i] != arg.literal_string[i])
-                                break :loop;
-                        }
-                    }
-                }
-
-                if (i == 0 and first.len > 0) {
-                    // no common prefix found
+                const common_prefix = getCommonPrefix(allocator, items) orelse {
                     return Regex.either(items).recursiveCopy(allocator);
-                }
-
-                const common_prefix = tryAlloc(allocator.dupe(u8, first[0..i]));
+                };
 
                 var added: std.StringHashMapUnmanaged(void) = .empty;
                 defer added.deinit(allocator);
@@ -933,15 +903,37 @@ const Simplifier = struct {
                 defer either_args.deinit(allocator);
 
                 for (items) |item| {
-                    const str = item.literal_string[i..];
-                    if (added.contains(str)) continue;
+                    const i = common_prefix.len;
+                    switch (item.*) {
+                        .literal_string => |s| {
+                            const str = s[i..];
+                            if (added.contains(str)) continue;
 
-                    tryAlloc(added.put(allocator, str, {}));
+                            tryAlloc(added.put(allocator, str, {}));
 
-                    const str_copy = tryAlloc(allocator.dupe(u8, str));
-                    tryAlloc(
-                        either_args.append(allocator, Regex.literal(str_copy).dupe(allocator)),
-                    );
+                            const str_copy = tryAlloc(allocator.dupe(u8, str));
+                            tryAlloc(
+                                either_args.append(allocator, Regex.literal(str_copy).dupe(allocator)),
+                            );
+                        },
+                        .concatenation => |cargs| {
+                            // if getCommonPrefix() above does not return null,
+                            // then a concat is guaranteed to have a first literal arg here
+                            const str = cargs[0].literal_string[i..];
+                            if (added.contains(str)) continue;
+
+                            tryAlloc(added.put(allocator, str, {}));
+
+                            const new_cargs = tryAlloc(allocator.dupe(RE, cargs));
+                            new_cargs[0] = &Regex.literal(str);
+                            defer allocator.free(new_cargs);
+
+                            tryAlloc(
+                                either_args.append(allocator, Regex.concat(new_cargs).recursiveCopy(allocator)),
+                            );
+                        },
+                        else => unreachable,
+                    }
                 }
 
                 if (either_args.items.len == 0) {
@@ -1123,6 +1115,8 @@ const Simplifier = struct {
                         j += 1;
                     }
 
+                    // probably an off-by-one error here
+
                     const lit = concatLiterals(allocator, flattened[i..j]);
 
                     tryAlloc(combined.append(allocator, lit));
@@ -1151,17 +1145,85 @@ const Simplifier = struct {
             },
 
             // [a-d]+
-            // concat(either(a,b,c,d), either(a,b,c,d), ...)
+            // concat(any, either(a,b,c,d), either(a,b,c,d), ...)
+            // either(aa.., ab..,, ac.., ...)
+
+            // either("abc", "ade")
+            // concat("a", either("bc", "de"))
+
+            // either("abc", "ade", "aaa"+, [a-e]+)
+
+            // either([a-c]+, [e-g]+)
+
+            // intersect("abc", "abd") == "ab"
+            // intersect("abcx", [abc]+) == "abc"
+            // intersect("abcx", concat([abc], [abc])) == "ab"
+
+            // either(either("aaa", "bbb"), "a")
+            // either("aaa", "bbb", "a")
+            // either("aaa", "a", "bbb")
+            // either(concat("a", either("aa", ""), "bbb")
+
+            // either("aabc", concat("aa", any), "abc")
+            // valid prefix would be "a"
+
+            // concat("aa", any).split(1) == .{"a", concat("a", any)}
+            // split probably doesn't make sense
+            // what if index is at something unplittable, like any
+            // applicable only to first few literal arg of concat
+
+            // re.split(i)
+            // re.charAt(i)
+
+            // either("aaa", [a-c]{3})
+            // "aaa" would be a valid prefix here?
+            // nope, it could skip substrings where there is ccc or abc
+            // so no, not a valid prefix
+
+            // [a-d]+
+            // concat(either("a", "b", "c", "d"), [a-d]*)
+            // concat(either("a", "b", "c", "d"), either("", [a-d]+))
+
+            // either("aaa", concat("a", [a-d]*), concat("b", [a-d]*), ...)
+
+            // intersect(either("aaa", "bbb"), "a") == "a"
 
             // is this valid? if so, what would it return?
             // intersect(literal("x"), either(...))
 
-            // TODO:
-            // intersect(alt1, alt2, charset1, charset2)
-            // I could do this
-            // that way I don't have to create ginormous strings
-            // in advance
-            //.char_class_set => {},
+            //
+            .char_class_set => |set| {
+                return switch (set.count()) {
+                    0 => Regex.dupe(&.none, allocator),
+
+                    // contains only one character, convert to literal
+                    1 => {
+                        const ch: u8 = @intCast(set.findFirstSet() orelse unreachable);
+                        return Regex.literal(&.{ch}).recursiveCopy(allocator);
+                    },
+
+                    // set is small enough, convert to either()
+                    // it would be a bit bigger, but also easier to
+                    // combine with other regexes for simplification
+                    2...16 => |len| {
+                        var buf: ArrayList(RE) = tryAlloc(
+                            ArrayList(RE).initCapacity(allocator, len),
+                        );
+                        defer buf.deinit(allocator);
+
+                        var iter = set.iterator(.{});
+                        while (iter.next()) |n| {
+                            const ch: u8 = @intCast(n);
+                            const lit = Regex.literal(&.{ch}).recursiveCopy(allocator);
+                            tryAlloc(buf.append(allocator, lit));
+                        }
+
+                        const args = tryAlloc(buf.toOwnedSlice(allocator));
+                        return Regex.either(args).dupe(allocator);
+                    },
+                    else => re.recursiveCopy(allocator),
+                };
+            },
 
             else => {
                 // Since the caller is meant to free whatever is returned from normalize()
@@ -1172,6 +1234,47 @@ const Simplifier = struct {
                 return re.recursiveCopy(allocator);
             },
         }
+    }
+
+    fn getCommonPrefix(allocator: Allocator, args: []RE) ?[]const u8 {
+        if (args.len == 0) return null;
+
+        var buf: ArrayList([]const u8) = tryAlloc(
+            ArrayList([]const u8).initCapacity(allocator, args.len),
+        );
+        defer buf.deinit(allocator);
+
+        for (args) |arg| {
+            switch (arg.*) {
+                .literal_string => |s| tryAlloc(buf.append(allocator, s)),
+                .concatenation => |concat_args| {
+                    if (concat_args.len == 0)
+                        tryAlloc(buf.append(allocator, ""))
+                    else if (concat_args[0].* == .literal_string)
+                        tryAlloc(buf.append(allocator, concat_args[0].literal_string))
+                    else
+                        return null;
+                },
+                else => return null,
+            }
+        }
+
+        const first = buf.items[0];
+
+        var i: usize = 0;
+        if (first.len > 0) {
+            loop: while (i < first.len) : (i += 1) {
+                for (buf.items[1..]) |arg| {
+                    if (i >= arg.len or first[i] != arg[i])
+                        break :loop;
+                }
+            }
+        }
+
+        return switch (i > 0 or first.len == 0) {
+            true => tryAlloc(allocator.dupe(u8, first[0..i])),
+            false => null,
+        };
     }
 
     fn distributeConcatOverAlt(re: RE, allocator: Allocator) ?RE {
@@ -1419,7 +1522,7 @@ const Formatter = struct {
                 const tag = switch (t) {
                     .concatenation => "cat",
                     .alternation => "alt",
-                    else => @compileError("blah"),
+                    else => unreachable,
                 };
 
                 const all_literals = blk: {
@@ -2178,7 +2281,6 @@ test "alternation 1" {
     try testing.expectEqualDeep(expected, actual);
     try testing.expect(expected.equals(actual));
 }
-
 test "alternation 2" {
     const allocator = testing.allocator;
     const re: RE = &.either(&.{
@@ -2286,6 +2388,39 @@ test "alternation 3" {
             &.literal("bcdex"),
             &.literal("aaa"),
             &.literal(""),
+        }),
+    });
+
+    const actual = re.normalize(allocator);
+    defer actual.recursiveFree(allocator);
+
+    try testing.expectEqualDeep(expected, actual);
+    try testing.expect(expected.equals(actual));
+}
+
+test "alternation 4" {
+    const allocator = testing.allocator;
+
+    const re: RE = &.either(&.{
+        &.either(&.{
+            &.literal("abc"),
+            &.concat(&.{
+                &.literal("abd"),
+                &.any,
+            }),
+            &.literal("abb"),
+        }),
+    });
+
+    const expected: RE = &.concat(&.{
+        &.literal("ab"),
+        &.either(&.{
+            &.literal("c"),
+            &.concat(&.{
+                &.literal("d"),
+                &.any,
+            }),
+            &.literal("b"),
         }),
     });
 
