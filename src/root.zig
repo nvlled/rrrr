@@ -164,9 +164,6 @@ pub const Regex = union(enum) {
 
     back_reference: usize,
 
-    // TODO: these three should probably be flags instead
-    // along with captured
-    // Regex = struct { value: RE, pre: start|boundary, post: end|boundary, normalized: bool }
     start,
     end,
     boundary,
@@ -787,66 +784,66 @@ pub const Regex = union(enum) {
 };
 
 const Simplifier = struct {
-    // TODO: re.normalize(allocator) for optimization
-    // / combine adjacent literals into a single literal
-    //   - if all concat args is all literal, convert concat to single literal
-    // / flatten nested concats
-    // / expand min repetition (if min is not too large)
-    //   / atLeast(2, "foo") -> concat("foofoo", zeroOrMore("foo"))
-    //   / atLeast(2, any) -> concat(any, any, zeroOrMore(any))
-    // - extract common either cases
-    //    -either("abc", "abc") == literal("abc")
-    //    -== concat("abc", either(""))
-    //    -either("") is different from either()
-    //    -either("") == any
-    //    -either() == none
-    //   - either() -> never
-    //     - concat(never) -> never
-    //     This doesn't sound quite right
-    //     What's the zero value for or-operators?
-    //     Is it zero or one (true or false)?
-    //     1 or 1 = 1
-    //     1 or 0 = 1
-    //     0 or 1 = 1
-    //     0 or 0 = 0
-    //     This does look like an addition, so the zero value should be 0?
+    // Simplification rules:
     //
-    //   - either(either(a,b), either(c,d)) ==? either(a,b,c,d)
-    //   - either(a,a,a,a,b) == either(a,b)
-    //   - either("xyz", "xyyy", "xxx") -> concat("x", either("yz", "yyy", "xx"))
-    //   - either("xyz", "xyyy", "") -> literal("")
-    //     this makes sense? even the regex tester confirms this
-    // - either with one elem -> remove either
-    // - combine either charsets
-    // - if either contains only literals, use a hashmap
-    //   - this will need to store the size of each key though
-    //     hash.contains(input[0..size]) for each key size
-    //   - maybe not, hashmap is not easy to copy around
-    // - .any != literal("") ?
-    //   this isn't quite right, any consumes one character,
-    //   whereas literal("") doesn't
-    //   - concat("", "x", "y") ==? "xy"
-    // - .concat() == ""
-    //   - or more generally, re(never, ...) -> never
-    // - use a non-allocating iterator for literal repetitions
+    //   note:
+    //     * for brevity, "foo" is same a literal("foo")
+    //     * unquoted vars a, b, c, x, y, z etc. are any regex expressions
+    //     * -> means "simplifies to"
     //
-    // regex is surprinsingly algebraic, or mathy
-    // whatever that's called
+    // - concat() -> ""
+    // - concat(x) -> x
+    // - concat(x, none, y) -> none
+    // - concat("a", "b", "c") -> "abc"
+    // - concat("a", "b", x, "c", "d") -> concat("ab", x, "cd")
+    // - concat(concat(a,b,c), concat(x,y,z)) -> concat(a, b, c, x, y, z)
+    //
+    // - either() -> none
+    // - either(none, x, y, z) -> either(x, y, z)
+    // - either(x) -> x
+    // - either(either(a,b), either(x), y) -> either(a, b, x, y)
+    // - either("fooA", "fooB", "fooC", "foo") -> concat("foo", either("A", "B", "C", ""))
+    // - either(a, a, b, b, b, c) -> either(a, b, c)
+    //
+    // - concat(either("12", "34"), either("qq", "ww"))
+    //      -> either("12qq", "12ww", "34qq", "34ww")
+    //
+    // - charset('x') -> "x"
+    // - charset() -> none
+    // - either(charset('a', 'b'), charset('c', 'd'))
+    //      -> charset('a', 'b', 'c', 'd')
+    //      -> either('a', 'b', 'c', 'd') // applies only for small charsets
+    //
+    //   note:
+    //     - zeroOrMore(x) == repeat(0, null, x)
+    //     - atEleast(n, x) == repeat(n, null, x)
+    //     - times(n, x) == repeat(n, n, x)
+    //
+    // - repeat(m, n, none) -> none
+    // - times(2, "a") -> "aa"
+    // - atLeast(2, "foo") -> concat("foofoo", zeroOrMore("foo"))
+    // - atLeast(3, x) -> concat(x, x, x, zeroOrMore(x))
+    //
+    // what expressions that could result to none though?
+    // - illegal placement of start and end
+    // - empty character sets
+    // other than either()
+    // if there's no actual cases that would happen,
+    // no need to explicitly handle it,
+    // except maybe for completeness sake
 
-    // Caller must recursively free the returned pointer afterwards,
+    // `normalize` simplifies `re` such that (1) it removes
+    // unneeded nodes (2) combines literals if possible and
+    // (3) makes it easier to get a literal prefix.
+    // This step is optional. `re` and `normalize(re)` are
+    // (or at least should be) equivalent
+    // when it comes to matching the same input strings.
+    //
+    // note: caller must recursively free the returned pointer afterwards,
     // either manually or use re.recursiveFree(allocator)
     fn normalize(re: RE, allocator: Allocator) RE {
         switch (re.*) {
             .alternation => |args| {
-                if (args.len == 0) {
-                    const result: RE = &.none;
-                    return result.dupe(allocator);
-                }
-
-                if (args.len == 1) {
-                    return normalize(args[0], allocator);
-                }
-
                 var buf: ArrayList(RE) = tryAlloc(
                     ArrayList(RE).initCapacity(allocator, args.len),
                 );
@@ -856,17 +853,19 @@ const Simplifier = struct {
                     var item = normalize(arg, allocator);
                     switch (item.*) {
                         .concatenation => {
-                            if (canDistribute(item)) {
-                                if (distributeConcatOverAlt(item, allocator)) |alt| {
-                                    item.recursiveFree(allocator);
-                                    item = alt;
-                                }
+                            if (distributeConcatOverAlt(item, allocator)) |alt| {
+                                item.recursiveFree(allocator);
+                                item = alt;
                             }
                         },
                         else => {},
                     }
 
                     switch (item.*) {
+                        .none => {
+                            // skip none
+                            item.recursiveFree(allocator);
+                        },
                         .alternation => |choices| {
                             // flatten nested either:
                             // either(either(a,b), either(c,d)) -> either(a,b,c,d)
@@ -877,6 +876,15 @@ const Simplifier = struct {
                         },
                         else => tryAlloc(buf.append(allocator, item)),
                     }
+                }
+
+                if (buf.items.len == 0) {
+                    const result: RE = &.none;
+                    return result.dupe(allocator);
+                }
+
+                if (buf.items.len == 1) {
+                    return buf.items[0];
                 }
 
                 const items = tryAlloc(buf.toOwnedSlice(allocator));
@@ -1066,10 +1074,17 @@ const Simplifier = struct {
                     var result: ArrayList(RE) = tryAlloc(
                         ArrayList(RE).initCapacity(allocator, args.len),
                     );
+                    defer {
+                        for (result.items) |item| {
+                            item.recursiveFree(allocator);
+                        }
+                        result.deinit(allocator);
+                    }
 
                     for (args) |arg| {
                         const item = normalize(arg, allocator);
                         switch (item.*) {
+                            .none => return item,
                             .concatenation => |list| {
                                 // flatten nested concats
                                 for (list) |x| tryAlloc(result.append(allocator, x));
@@ -1112,8 +1127,6 @@ const Simplifier = struct {
                         j += 1;
                     }
 
-                    // probably an off-by-one error here
-
                     const lit = concatLiterals(allocator, flattened[i..j]);
 
                     tryAlloc(combined.append(allocator, lit));
@@ -1141,54 +1154,6 @@ const Simplifier = struct {
                 return Regex.literal(str).dupe(allocator);
             },
 
-            // [a-d]+
-            // concat(any, either(a,b,c,d), either(a,b,c,d), ...)
-            // either(aa.., ab..,, ac.., ...)
-
-            // either("abc", "ade")
-            // concat("a", either("bc", "de"))
-
-            // either("abc", "ade", "aaa"+, [a-e]+)
-
-            // either([a-c]+, [e-g]+)
-
-            // intersect("abc", "abd") == "ab"
-            // intersect("abcx", [abc]+) == "abc"
-            // intersect("abcx", concat([abc], [abc])) == "ab"
-
-            // either(either("aaa", "bbb"), "a")
-            // either("aaa", "bbb", "a")
-            // either("aaa", "a", "bbb")
-            // either(concat("a", either("aa", ""), "bbb")
-
-            // either("aabc", concat("aa", any), "abc")
-            // valid prefix would be "a"
-
-            // concat("aa", any).split(1) == .{"a", concat("a", any)}
-            // split probably doesn't make sense
-            // what if index is at something unplittable, like any
-            // applicable only to first few literal arg of concat
-
-            // re.split(i)
-            // re.charAt(i)
-
-            // either("aaa", [a-c]{3})
-            // "aaa" would be a valid prefix here?
-            // nope, it could skip substrings where there is ccc or abc
-            // so no, not a valid prefix
-
-            // [a-d]+
-            // concat(either("a", "b", "c", "d"), [a-d]*)
-            // concat(either("a", "b", "c", "d"), either("", [a-d]+))
-
-            // either("aaa", concat("a", [a-d]*), concat("b", [a-d]*), ...)
-
-            // intersect(either("aaa", "bbb"), "a") == "a"
-
-            // is this valid? if so, what would it return?
-            // intersect(literal("x"), either(...))
-
-            //
             .char_class_set => |set| {
                 return switch (set.count()) {
                     0 => Regex.dupe(&.none, allocator),
@@ -1274,10 +1239,10 @@ const Simplifier = struct {
         };
     }
 
+    // Transforms an expression like concat(either(a, b), either(c,d))
+    // to either(concat(a,c), concat(b,d)). If a,b,c,d are all literals,
+    // then the result is a flat either consisting only of literals.
     fn distributeConcatOverAlt(re: RE, allocator: Allocator) ?RE {
-        // assumes re is normalized and canDistribute(re) holds
-        // meaning, re is a concat that consists only of literal or alt
-
         if (re.* != .concatenation) return re.recursiveCopy(allocator);
         if (re.concatenation.len == 0) return re.recursiveCopy(allocator);
 
@@ -1379,17 +1344,6 @@ const Simplifier = struct {
         }
 
         return accumulator;
-    }
-
-    fn canDistribute(re: RE) bool {
-        if (re.* != .concatenation) return false;
-        for (re.concatenation) |item| {
-            switch (item.*) {
-                .alternation, .literal_string => {},
-                else => return false,
-            }
-        }
-        return true;
     }
 
     fn concatLiterals(allocator: Allocator, args: []const RE) RE {
@@ -2202,6 +2156,22 @@ test "normalize concat 2" {
         &.any,
         &.literal("ghijkl"),
     });
+    try testing.expectEqualDeep(expected, actual);
+    try testing.expect(expected.equals(actual));
+}
+
+test "normalize concat 3" {
+    const re: RE = &.concat(&.{
+        &.literal("abc"),
+        &.literal("def"),
+        &.none,
+    });
+
+    const allocator = testing.allocator;
+    const actual = re.normalize(allocator);
+    defer actual.recursiveFree(allocator);
+
+    const expected: RE = &.none;
     try testing.expectEqualDeep(expected, actual);
     try testing.expect(expected.equals(actual));
 }
