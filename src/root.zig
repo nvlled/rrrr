@@ -744,9 +744,6 @@ pub const Regex = union(enum) {
     }
 
     fn getLiteralPrefix(self: RE) ?[]const u8 {
-        // TODO: an empty string is returned to stop searching
-        // since returning null would proceed to search the
-        // rest of the re tree. There's probably a better way to do that.
         return switch (self.*) {
             .literal_string => |val| val,
             .concatenation => |args| {
@@ -756,11 +753,11 @@ pub const Regex = union(enum) {
             },
             .captured => |re| getLiteralPrefix(re),
             .repetition => |val| {
-                if (val.min == 0) return "";
+                if (val.min == 0) return null;
                 if (getLiteralPrefix(val.re)) |prefix| return prefix;
                 return null;
             },
-            .alternation => "",
+            .alternation => null,
             else => null,
         };
     }
