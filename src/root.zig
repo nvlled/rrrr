@@ -115,6 +115,8 @@ pub const MatchResult = struct {
 const MatchState = struct {
     capture: ?*const Capture,
     input: MatchInput,
+    running: *bool,
+    thread_pool: ?*std.Thread.Pool, // TODO: remove optional
 
     // Currently only used for intermediate captures,
     // particularly, for the `dupeAll()` and `connect()` methods
@@ -184,6 +186,8 @@ const MatchState = struct {
             .capture = self.capture,
             .input = self.input.slice(offset),
             .arena = self.arena,
+            .running = self.running,
+            .thread_pool = self.thread_pool,
         };
     }
 };
@@ -599,6 +603,8 @@ pub const Regex = union(enum) {
     }
 
     fn match(self: Self, allocator: Allocator, state: MatchState) ?MatchResult {
+        if (!state.running.*) return null;
+
         const input_arg = state.input;
         const match_zero: MatchResult = .{ .pos = input_arg.pos, .len = 0 };
 
@@ -715,6 +721,7 @@ pub const Regex = union(enum) {
         state_arg: MatchState,
         args: []const RE,
     ) ?MatchResult {
+        if (!state_arg.running.*) return null;
         if (args.len == 0) return .{ .pos = state_arg.input.pos, .len = 0 };
 
         var i: usize = 0;
@@ -751,21 +758,97 @@ pub const Regex = union(enum) {
 
         const rest_args = args[i + 1 ..];
         switch (args[i].*) {
-            .repetition, .alternation => {
+            .repetition => {
                 var iterator: MatchIterator = .init(args[i], state);
                 defer iterator.deinit(allocator);
 
-                while (iterator.next(allocator)) |m| {
-                    const sub_state = state.sliceInput(m.len);
-                    if (matchConcat(allocator, sub_state, rest_args)) |m2| {
-                        return .{
+                // Spawn a thread for each repetition match.
+                // Since repetitions must match the shortest
+                // or longest possible match, the checking
+                // of matches must be done in order:
+
+                var thread_pool = state_arg.thread_pool.?;
+                var batch: [4]struct {
+                    wg: std.Thread.WaitGroup,
+                    result: ?MatchResult,
+                } = .{
+                    .{ .wg = .{}, .result = null },
+                    .{ .wg = .{}, .result = null },
+                    .{ .wg = .{}, .result = null },
+                    .{ .wg = .{}, .result = null },
+                };
+
+                var running = true;
+                while (running) {
+                    var processed: usize = 0;
+                    for (0..batch.len) |j| {
+                        if (iterator.next(allocator)) |m| {
+                            processed += 1;
+                            const sub_state = state.sliceInput(m.len);
+                            thread_pool.spawnWg(
+                                &batch[j].wg,
+                                matchConcatWrapped,
+                                .{
+                                    allocator,
+                                    m,
+                                    sub_state,
+                                    rest_args,
+                                    &batch[j].result,
+                                },
+                            );
+                        } else running = false;
+                    }
+
+                    for (0..processed) |j| {
+                        batch[j].wg.wait();
+
+                        if (batch[j].result) |m| return .{
                             .pos = result.pos,
-                            .len = result.len + m.len + m2.len,
-                            .capture = m2.capture,
+                            .len = result.len + m.len,
+                            .capture = m.capture,
                         };
+
+                        batch[j].wg.reset();
                     }
                 }
+
+                return null;
             },
+
+            .alternation => {
+                var iterator: MatchIterator = .init(args[i], state);
+                defer iterator.deinit(allocator);
+
+                var thread_pool = state_arg.thread_pool.?;
+                var wg: std.Thread.WaitGroup = .{};
+                var sub_result: ?MatchResult = null;
+
+                while (iterator.next(allocator)) |m| {
+                    if (!state_arg.running.*) return null;
+                    if (sub_result != null) break;
+
+                    const sub_state = state.sliceInput(m.len);
+                    thread_pool.spawnWg(
+                        &wg,
+                        matchConcatWrapped,
+                        .{
+                            allocator,
+                            m,
+                            sub_state,
+                            rest_args,
+                            &sub_result,
+                        },
+                    );
+                }
+                wg.wait();
+
+                return if (sub_result) |m| .{
+                    .pos = result.pos,
+                    .len = result.len + m.len,
+                    .capture = m.capture,
+                } else null;
+            },
+
             .captured => |re| {
                 const m = re.match(allocator, state) orelse return null;
 
@@ -777,6 +860,8 @@ pub const Regex = union(enum) {
                     },
                     .input = state.input.slice(m.len),
                     .arena = state.arena,
+                    .running = state.running,
+                    .thread_pool = state.thread_pool,
                 };
 
                 if (matchConcat(allocator, sub_state, rest_args)) |m2| {
@@ -794,21 +879,50 @@ pub const Regex = union(enum) {
         return null;
     }
 
-    pub fn search(self: Self, allocator: Allocator, input: []const u8) ?MatchResult {
+    fn matchConcatWrapped(
+        alloc: Allocator,
+        m: MatchResult,
+        state: MatchState,
+        args: []const RE,
+        dest_result: *?MatchResult,
+    ) void {
+        if (matchConcat(alloc, state, args)) |m2| {
+            dest_result.* = .{
+                .pos = m.pos,
+                .len = m.len + m2.len,
+                .capture = m2.capture,
+            };
+        }
+    }
+
+    pub fn search(self: Self, allocator: Allocator, input: []const u8) std.Thread.SpawnError!?MatchResult {
         var pos: usize = 0;
         if (getLiteralPrefix(&self)) |prefix| {
             if (std.mem.indexOf(u8, input, prefix)) |i| pos = i;
         }
 
+        var thread_pool: std.Thread.Pool = undefined;
+        try thread_pool.init(.{
+            .allocator = allocator,
+        });
+        defer thread_pool.deinit();
+
         var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+
+        // TODO: use atomic
+        var running = true;
         const state: MatchState = .{
+            .running = &running,
             .input = .{ .value = input, .pos = pos },
             .capture = null,
             .arena = &arena,
+            .thread_pool = &thread_pool,
         };
-        defer arena.deinit();
 
-        var result = matchConcat(allocator, state, &.{&self});
+        var result = self.match(allocator, state);
+        running = false;
+
         if (result) |*m| if (m.capture) |c| {
             m.capture = c.dupeAll(allocator);
         };
@@ -826,6 +940,7 @@ pub const Regex = union(enum) {
             allocator: Allocator,
             source: []const u8,
         ) SearchIterator {
+            const running = tryAlloc(allocator.create(bool));
             const arena = tryAlloc(allocator.create(std.heap.ArenaAllocator));
             arena.* = .init(allocator);
             return .{
@@ -838,6 +953,8 @@ pub const Regex = union(enum) {
                     },
                     .capture = null,
                     .arena = arena,
+                    .running = running,
+                    .thread_pool = null, // TODO:
                 },
             };
         }
@@ -845,10 +962,13 @@ pub const Regex = union(enum) {
         fn deinit(self: *@This(), allocator: Allocator) void {
             self.state.arena.deinit();
             allocator.destroy(self.state.arena);
+            allocator.destroy(self.state.running);
         }
 
         // Caller should result.freeCaptures() if any capture was done
         fn next(self: *@This(), allocator: Allocator) ?MatchResult {
+            _ = self.state.arena.reset(.retain_capacity);
+
             const re = self.re;
 
             var input = &self.state.input;
@@ -2189,7 +2309,7 @@ test {
         const re = item.re.normalize(allocator);
         defer re.recursiveFree(allocator);
 
-        const result = re.search(allocator, item.input);
+        const result = try re.search(allocator, item.input);
         defer if (result) |m| m.freeCaptures(allocator);
 
         errdefer {
@@ -2775,7 +2895,7 @@ test "nested captures" {
         "bc",
     };
 
-    const result = re.search(allocator, source);
+    const result = try re.search(allocator, source);
     try testing.expect(result != null);
     const m = result orelse unreachable;
     defer m.freeCaptures(allocator);
