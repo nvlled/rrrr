@@ -11,7 +11,7 @@ pub const MatchResult = struct {
     len: usize,
     capture: ?*const Capture = null,
 
-    // Resulting captures that is intended to be allocated on the heap memory.
+    // Resulting captures that are intended to be allocated on the heap memory.
     //
     // (heap)
     // capture
@@ -27,10 +27,14 @@ pub const MatchResult = struct {
     //                         |-> capture
     //                               .next   (stack frame)
     const Capture = struct {
-        // TODO: replace value with pos
-        value: []const u8,
-        index: usize,
+        len: usize,
+        pos: usize,
         next: ?*const Capture,
+
+        fn string(self: *const Capture, source: []const u8) []const u8 {
+            const i = self.pos;
+            return source[i .. i + self.len];
+        }
 
         // Returns the number of captures in the list.
         fn count(self: *const Capture) usize {
@@ -83,11 +87,13 @@ pub const MatchResult = struct {
             const n: usize = self.count();
             const slice = tryAlloc(allocator.alloc(*const Capture, n));
 
+            var i: usize = 0;
             var current: ?*const Capture = self;
             while (current) |capture| {
-                slice[capture.index] = capture;
+                slice[i] = capture;
                 const next = capture.next;
                 current = next;
+                i += 1;
             }
 
             return slice;
@@ -156,9 +162,14 @@ const MatchState = struct {
     //                        |  capture
     //                        ---- .prev    (stack frame)
     const Capture = struct {
-        value: []const u8,
-        index: usize,
+        pos: usize,
+        len: usize,
         prev: ?*const Capture,
+
+        fn string(self: *const Capture, source: []const u8) []const u8 {
+            const i = self.pos;
+            return source[i .. i + self.len];
+        }
 
         fn dupe(
             self: *const Capture,
@@ -166,8 +177,8 @@ const MatchState = struct {
         ) *MatchResult.Capture {
             const result = tryAlloc(allocator.create(MatchResult.Capture));
             result.* = .{
-                .value = self.value,
-                .index = self.index,
+                .pos = self.pos,
+                .len = self.len,
                 .next = null,
             };
             return result;
@@ -175,13 +186,20 @@ const MatchState = struct {
     };
 
     fn getCapture(self: @This(), index: usize) ?*const Capture {
-        var current: ?*const Capture = self.capture orelse return null;
-        while (true) {
-            if (current) |cap| {
-                if (cap.index == index) return cap;
-                current = cap.prev;
-            } else return null;
+        var current: *const Capture = self.capture orelse return null;
+
+        var array: [100]*const Capture = undefined;
+        array[0] = current;
+
+        var len: usize = 1;
+        while (current.prev) |prev| {
+            if (len >= array.len) @panic("too many captures, limit is 100");
+            current = prev;
+            array[len] = current;
+            len += 1;
         }
+
+        return array[len - 1 - index];
     }
 
     fn sliceInput(self: @This(), offset: usize) MatchState {
@@ -190,11 +208,6 @@ const MatchState = struct {
             .input = self.input.slice(offset),
             .arena = self.arena,
         };
-    }
-
-    fn numCaptures(self: @This()) usize {
-        if (self.capture) |c| return c.index + 1;
-        return 0;
     }
 };
 
@@ -650,12 +663,11 @@ pub const Regex = union(enum) {
             },
 
             .back_reference => |index| {
-                if (index >= 0 and index < state.numCaptures()) {
-                    const input = input_arg.string();
-                    const item = (state.getCapture(index) orelse return null).value;
-                    if (item.len > 0 and std.mem.eql(u8, item, input[0..@min(item.len, input.len)])) {
-                        return .{ .pos = input_arg.pos, .len = item.len };
-                    }
+                const input = input_arg.string();
+                const item = (state.getCapture(index) orelse return null);
+                const str = item.string(input_arg.value);
+                if (item.len > 0 and std.mem.eql(u8, str, input[0..@min(str.len, input.len)])) {
+                    return .{ .pos = input_arg.pos, .len = item.len };
                 }
                 return null;
             },
@@ -777,8 +789,8 @@ pub const Regex = union(enum) {
 
                 const sub_state: MatchState = .{
                     .capture = &.{
-                        .value = m.string(state.input.value),
-                        .index = if (state.capture) |c| c.index + 1 else 0,
+                        .pos = m.pos,
+                        .len = m.len,
                         .prev = if (state.capture) |c| c else null,
                     },
                     .input = state.input.slice(m.len),
@@ -2792,7 +2804,7 @@ test "nested captures" {
     var i: usize = 0;
     var iter = m.capture;
     while (iter) |c| {
-        try testing.expectEqualStrings(expected_captures[i], c.value);
+        try testing.expectEqualStrings(expected_captures[i], c.string(source));
         iter = c.next;
         i += 1;
     }
@@ -2851,7 +2863,7 @@ test "match captured iterator" {
 
         var j: usize = 0;
         for (slice) |c| {
-            try testing.expectEqualStrings(expected[i].captures[j], c.value);
+            try testing.expectEqualStrings(expected[i].captures[j], c.string(source));
             j += 1;
         }
     }
