@@ -1741,7 +1741,7 @@ const MatchIterator = union(enum) {
                 return .{ .pos = self.pos, .len = self.len };
             }
 
-            const max = self.max orelse std.math.maxInt(usize);
+            const max = self.max orelse std.math.maxInt(usize) - 1;
 
             if (self.iterations <= max) {
                 const sub_state = state.sliceInput(self.len);
