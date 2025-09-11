@@ -646,19 +646,27 @@ pub const Regex = union(enum) {
                 return null;
             },
 
-            .repetition => |val| {
-                return switch (val.re.*) {
-                    .captured => @panic(
-                        \\capture must not be done inside repetition,
-                        \\move it outside instead: capture(repeat(..))"
-                    ),
-                    else => matchConcat(allocator, state, &.{&self}),
-                };
+            .repetition => |val| switch (val.re.*) {
+                .captured => @panic(
+                    \\capture must not be done directly inside of repetition,
+                    \\move it outside instead: capture(repeat(...))
+                    \\or normalize it do it automatically
+                ),
+                else => matchConcat(allocator, state, &.{&self}),
             },
 
-            .captured => |re| return matchConcat(allocator, state, &.{re}),
+            .captured => return matchConcat(allocator, state, &.{&self}),
 
-            .alternation => matchConcat(allocator, state, &.{&self}),
+            .alternation => |args| {
+                for (args) |re| {
+                    if (re.* == .captured)
+                        @panic(
+                            \\capture must not be done directly inside of alternation,
+                            \\move it outside instead: capture(either(...))
+                        );
+                }
+                return matchConcat(allocator, state, &.{&self});
+            },
 
             .concatenation => |args| matchConcat(allocator, state, args),
 
@@ -1096,6 +1104,18 @@ const Simplifier = struct {
                 switch (copy.re.*) {
                     // repeat(none) => none
                     .none => return copy.re,
+
+                    .captured => |re2| {
+                        defer allocator.destroy(copy.re);
+                        return Regex.capture(
+                            Regex.dupe(&.{ .repetition = .{
+                                .re = re2,
+                                .min = val.min,
+                                .max = val.max,
+                                .greedy = val.greedy,
+                            } }, allocator),
+                        ).dupe(allocator);
+                    },
 
                     .repetition => |val2| {
                         if (val.greedy != val2.greedy) {
