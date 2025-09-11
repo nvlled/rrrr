@@ -98,29 +98,6 @@ pub const MatchResult = struct {
 
             return slice;
         }
-
-        // Returns a new (copy) of the list
-        // with the two args appended together.
-        // Caller must free the returned capture list.
-        fn connect(
-            allocator: Allocator,
-            left_arg: ?*const Capture,
-            right_arg: ?*const Capture,
-        ) ?*const Capture {
-            const right = if (right_arg) |c| c.dupeAll(allocator) else null;
-            if (left_arg == null) {
-                return right;
-            }
-            const left = left_arg.?.dupeAll(allocator);
-
-            var tail: *Capture = left;
-            while (tail.next) |c| {
-                tail = @constCast(c);
-            }
-
-            tail.next = right;
-            return left;
-        }
     };
 
     pub fn freeCaptures(self: @This(), allocator: Allocator) void {
@@ -171,7 +148,7 @@ const MatchState = struct {
             return source[i .. i + self.len];
         }
 
-        fn dupe(
+        fn toResult(
             self: *const Capture,
             allocator: Allocator,
         ) *MatchResult.Capture {
@@ -607,9 +584,6 @@ pub const Regex = union(enum) {
         return result.dupe(allocator);
     }
 
-    // TODO: probably just rename this to free
-    // and recursiveCopy to copy
-    // re.free()
     pub fn recursiveFree(self: RE, allocator: Allocator) void {
         switch (self.*) {
             .literal_string => |val| allocator.free(val),
@@ -802,19 +776,7 @@ pub const Regex = union(enum) {
                     return .{
                         .pos = result.pos,
                         .len = result.len + m.len + m2.len,
-                        .capture = if (sub_state.capture) |c| blk: {
-                            const head = c.dupe(arena);
-                            head.next = MatchResult.Capture.connect(
-                                arena,
-                                m.capture,
-                                m2.capture,
-                            );
-                            break :blk head;
-                        } else MatchResult.Capture.connect(
-                            arena,
-                            m.capture,
-                            m2.capture,
-                        ),
+                        .capture = sub_state.capture.?.toResult(arena),
                     };
                 }
             },
