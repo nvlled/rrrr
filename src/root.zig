@@ -1085,14 +1085,102 @@ pub const Regex = union(enum) {
         };
     }
 
+    const ReplaceIterator = struct {
+        search_iterator: SearchIterator,
+        output: std.Io.Writer.Allocating,
+        input: []const u8,
+
+        _deinitialized: bool = false,
+        _write_offset: usize = 0,
+        _match_start: usize = 0,
+        _match_end: usize = 0,
+
+        const Item = struct {
+            match: MatchResult,
+            _replacer: *ReplaceIterator,
+
+            pub inline fn freeCaptures(self: *@This()) void {
+                self.match.freeCaptures();
+            }
+        };
+
+        pub fn init(
+            re: RE,
+            allocator: Allocator,
+            input: []const u8,
+        ) !@This() {
+            return .{
+                .search_iterator = try SearchIterator.init(re, allocator, input),
+                .input = input,
+                .output = .init(allocator),
+            };
+        }
+
+        pub fn deinit(self: *@This(), allocator: Allocator) void {
+            if (!self._deinitialized) {
+                self._deinitialized = true;
+                self.search_iterator.deinit(allocator);
+                self.output.deinit();
+            }
+        }
+
+        pub fn next(self: *@This(), allocator: Allocator) ?Item {
+            const m = self.search_iterator.next(allocator) orelse {
+                self._match_start = self.input.len;
+                return null;
+            };
+            self._match_start = m.pos;
+            self._match_end = m.pos + m.len;
+
+            return .{
+                .match = m,
+                ._replacer = self,
+            };
+        }
+
+        pub fn write(self: *@This(), str: []const u8) std.Io.Writer.Error!void {
+            const w = &self.output.writer;
+            const input = self.input;
+            try w.writeAll(input[self._write_offset..self._match_start]);
+            try w.writeAll(str);
+            self._write_offset = self._match_end;
+            self._match_start = self._match_end;
+        }
+
+        pub fn string(self: *@This(), allocator: Allocator) error{
+            WriteFailed,
+            OutOfMemory,
+        }![]const u8 {
+            defer self.deinit(allocator);
+            const input = self.input;
+            const w = &self.output.writer;
+
+            // if iteration was break'ed mid-way, write remaining string anyways
+            try w.writeAll(input[self._write_offset..]);
+
+            return self.output.toOwnedSlice();
+        }
+    };
+
+    pub fn replaceIteratively(self: RE, allocator: Allocator, input: []const u8) !ReplaceIterator {
+        return ReplaceIterator.init(self, allocator, input);
+    }
+
     fn replaceAll(
         self: Self,
-        input: std.io.AnyWriter,
-        output: std.io.AnyWriter,
-    ) void {
-        _ = self;
-        _ = input;
-        _ = output;
+        allocator: Allocator,
+        input: []const u8,
+        replacement: []const u8,
+    ) ![]const u8 {
+        var replacer = try self.replaceIteratively(allocator, input);
+        defer replacer.deinit(allocator);
+
+        while (replacer.next(allocator)) |entry| {
+            defer entry.match.freeCaptures(allocator);
+            try replacer.write(replacement);
+        }
+
+        return replacer.string(allocator);
     }
 
     inline fn normalize(re: RE, allocator: Allocator) RE {
@@ -3039,4 +3127,40 @@ test "match captured iterator" {
             j += 1;
         }
     }
+    try testing.expect(i > 0);
+}
+
+test "replace iteratively" {
+    const allocator = testing.allocator;
+    const re: RE = &.oneOrMore(&.literal("a"));
+    const source = "aa aaaa aaaaa aa aabc a x";
+    const expected = "[aa] [aaaa] [aaaaa] [aa] [aa]bc [a] x";
+
+    var replacer = try re.replaceIteratively(allocator, source);
+    defer replacer.deinit(allocator);
+
+    while (replacer.next(allocator)) |entry| {
+        const s = entry.match.string(source);
+        try replacer.write("[");
+        try replacer.write(s);
+        try replacer.write("]");
+    }
+
+    const output = try replacer.string(allocator);
+    defer allocator.free(output);
+
+    try testing.expectEqualStrings(expected, output);
+}
+
+test "replace" {
+    const allocator = testing.allocator;
+    const re: RE = &.concat(&.{
+        &.oneOrMore(&.literal("a")),
+        &.boundary,
+    });
+    const source = "aa aaaa aaaaa aa aabc a";
+    const output = try re.replaceAll(allocator, source, "x");
+    defer allocator.free(output);
+
+    try testing.expectEqualStrings("x x x x aabc x", output);
 }
