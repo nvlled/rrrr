@@ -268,10 +268,6 @@ const CharClass = struct {
 
 pub const RE = *const Regex;
 
-// TODO: move tests to another file
-// TODO: custom matchers?
-// TODO: replaceAll(
-
 pub const Regex = union(enum) {
     const Self = @This();
 
@@ -977,6 +973,9 @@ pub const Regex = union(enum) {
         prefix: ?[]const u8,
         state: MatchState,
 
+        _last_pos: usize = 0,
+        _last_len: usize = 0,
+
         fn init(
             re: RE,
             allocator: Allocator,
@@ -1038,9 +1037,24 @@ pub const Regex = union(enum) {
                 defer self.state.running.store(false, .unordered);
 
                 if (re.match(allocator, self.state)) |m| {
+                    if (m.pos == self._last_pos and
+                        m.len == self._last_pos)
+                    {
+                        // match is the same as before, so it's not moving anymore
+                        // this could happen if regex is an empty string,
+                        // so just break and skip to the end
+                        // to avoid infinite loop
+                        input.pos = input.value.len;
+                        m.freeCaptures(allocator);
+                        return null;
+                    }
+
+                    self._last_pos = m.pos;
+                    self._last_len = m.len;
                     self.state.input = self.state.input.slice(m.len);
                     return m;
                 }
+
                 input.pos += 1;
             }
 
