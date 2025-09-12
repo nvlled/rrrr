@@ -98,6 +98,28 @@ pub const MatchResult = struct {
 
             return slice;
         }
+
+        // Returns a new (copy) of the list
+        // with the two args appended together.
+        // Caller must free the returned capture list.
+        fn connect(
+            arena: Allocator,
+            left_arg: ?*const Capture,
+            right_arg: ?*const Capture,
+        ) ?*const Capture {
+            if (left_arg == null) {
+                return right_arg;
+            }
+            const left = left_arg.?.dupeAll(arena);
+
+            var tail: *Capture = left;
+            while (tail.next) |c| {
+                tail = @constCast(c);
+            }
+
+            tail.next = right_arg;
+            return left;
+        }
     };
 
     pub fn freeCaptures(self: @This(), allocator: Allocator) void {
@@ -881,7 +903,16 @@ pub const Regex = union(enum) {
                     return .{
                         .pos = result.pos,
                         .len = result.len + m.len + m2.len,
-                        .capture = sub_state.capture.?.toResult(arena),
+                        .capture = blk: {
+                            const c = sub_state.capture.?;
+                            const head = c.toResult(arena);
+                            head.next = MatchResult.Capture.connect(
+                                arena,
+                                m.capture,
+                                m2.capture,
+                            );
+                            break :blk head;
+                        },
                     };
                 }
             },
