@@ -115,8 +115,8 @@ pub const MatchResult = struct {
 const MatchState = struct {
     capture: ?*const Capture,
     input: MatchInput,
-    running: *bool,
-    thread_pool: ?*std.Thread.Pool, // TODO: remove optional
+    running: *std.atomic.Value(bool),
+    thread_pool: *std.Thread.Pool,
 
     // Currently only used for intermediate captures,
     // particularly, for the `dupeAll()` and `connect()` methods
@@ -603,7 +603,7 @@ pub const Regex = union(enum) {
     }
 
     fn match(self: Self, allocator: Allocator, state: MatchState) ?MatchResult {
-        if (!state.running.*) return null;
+        if (!state.running.load(.unordered)) return null;
 
         const input_arg = state.input;
         const match_zero: MatchResult = .{ .pos = input_arg.pos, .len = 0 };
@@ -721,7 +721,7 @@ pub const Regex = union(enum) {
         state_arg: MatchState,
         args: []const RE,
     ) ?MatchResult {
-        if (!state_arg.running.*) return null;
+        if (!state_arg.running.load(.unordered)) return null;
         if (args.len == 0) return .{ .pos = state_arg.input.pos, .len = 0 };
 
         var i: usize = 0;
@@ -767,7 +767,7 @@ pub const Regex = union(enum) {
                 // or longest possible match, the checking
                 // of matches must be done in order:
 
-                var thread_pool = state_arg.thread_pool.?;
+                var thread_pool = state_arg.thread_pool;
                 var batch: [4]struct {
                     wg: std.Thread.WaitGroup,
                     result: ?MatchResult,
@@ -778,13 +778,16 @@ pub const Regex = union(enum) {
                     .{ .wg = .{}, .result = null },
                 };
 
-                var running = true;
-                while (running) {
+                var hasMore = true;
+                var running: std.atomic.Value(bool) = .init(true);
+                while (hasMore) {
                     var processed: usize = 0;
                     for (0..batch.len) |j| {
                         if (iterator.next(allocator)) |m| {
                             processed += 1;
-                            const sub_state = state.sliceInput(m.len);
+                            var sub_state = state.sliceInput(m.len);
+                            sub_state.running = &running;
+
                             thread_pool.spawnWg(
                                 &batch[j].wg,
                                 matchConcatWrapped,
@@ -796,17 +799,20 @@ pub const Regex = union(enum) {
                                     &batch[j].result,
                                 },
                             );
-                        } else running = false;
+                        } else hasMore = false;
                     }
 
                     for (0..processed) |j| {
                         batch[j].wg.wait();
 
-                        if (batch[j].result) |m| return .{
-                            .pos = result.pos,
-                            .len = result.len + m.len,
-                            .capture = m.capture,
-                        };
+                        if (batch[j].result) |m| {
+                            running.store(false, .unordered);
+                            return .{
+                                .pos = result.pos,
+                                .len = result.len + m.len,
+                                .capture = m.capture,
+                            };
+                        }
 
                         batch[j].wg.reset();
                     }
@@ -819,12 +825,12 @@ pub const Regex = union(enum) {
                 var iterator: MatchIterator = .init(args[i], state);
                 defer iterator.deinit(allocator);
 
-                var thread_pool = state_arg.thread_pool.?;
+                var thread_pool = state_arg.thread_pool;
                 var wg: std.Thread.WaitGroup = .{};
                 var sub_result: ?MatchResult = null;
 
                 while (iterator.next(allocator)) |m| {
-                    if (!state_arg.running.*) return null;
+                    if (!state_arg.running.load(.unordered)) return null;
                     if (sub_result != null) break;
 
                     const sub_state = state.sliceInput(m.len);
@@ -840,6 +846,12 @@ pub const Regex = union(enum) {
                         },
                     );
                 }
+
+                // Wait for all sub-matches to finish.
+                // Ideally this should just wait for just one
+                // one match to occur, but that would fail
+                // if regex isn't normalized and there's
+                // a common prefix between the choices.
                 wg.wait();
 
                 return if (sub_result) |m| .{
@@ -910,8 +922,7 @@ pub const Regex = union(enum) {
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
 
-        // TODO: use atomic
-        var running = true;
+        var running: std.atomic.Value(bool) = .init(true);
         const state: MatchState = .{
             .running = &running,
             .input = .{ .value = input, .pos = pos },
@@ -921,7 +932,7 @@ pub const Regex = union(enum) {
         };
 
         var result = self.match(allocator, state);
-        running = false;
+        running.store(true, .unordered);
 
         if (result) |*m| if (m.capture) |c| {
             m.capture = c.dupeAll(allocator);
@@ -939,10 +950,17 @@ pub const Regex = union(enum) {
             re: RE,
             allocator: Allocator,
             source: []const u8,
-        ) SearchIterator {
-            const running = tryAlloc(allocator.create(bool));
+        ) !SearchIterator {
+            const running = tryAlloc(allocator.create(std.atomic.Value(bool)));
+
+            const thread_pool = tryAlloc(allocator.create(std.Thread.Pool));
+            try thread_pool.init(.{
+                .allocator = allocator,
+            });
+
             const arena = tryAlloc(allocator.create(std.heap.ArenaAllocator));
             arena.* = .init(allocator);
+
             return .{
                 .re = re,
                 .prefix = getLiteralPrefix(re),
@@ -954,15 +972,19 @@ pub const Regex = union(enum) {
                     .capture = null,
                     .arena = arena,
                     .running = running,
-                    .thread_pool = null, // TODO:
+                    .thread_pool = thread_pool,
                 },
             };
         }
 
         fn deinit(self: *@This(), allocator: Allocator) void {
+            allocator.destroy(self.state.running);
+
             self.state.arena.deinit();
             allocator.destroy(self.state.arena);
-            allocator.destroy(self.state.running);
+
+            self.state.thread_pool.deinit();
+            allocator.destroy(self.state.thread_pool);
         }
 
         // Caller should result.freeCaptures() if any capture was done
@@ -981,6 +1003,9 @@ pub const Regex = union(enum) {
                     input.pos = pos;
                 }
 
+                self.state.running.store(true, .unordered);
+                defer self.state.running.store(false, .unordered);
+
                 if (re.match(allocator, self.state)) |m| {
                     self.state.input = self.state.input.slice(m.len);
                     return m;
@@ -992,7 +1017,7 @@ pub const Regex = union(enum) {
         }
     };
 
-    pub fn searchAll(self: RE, allocator: Allocator, source: []const u8) SearchIterator {
+    pub fn searchAll(self: RE, allocator: Allocator, source: []const u8) !SearchIterator {
         return SearchIterator.init(self, allocator, source);
     }
 
@@ -2947,7 +2972,7 @@ test "match captured iterator" {
         &.capture(&.literal("bc")),
     });
     const source = "aabcabc   aaabcasdjfabciasofaaaabca";
-    var iterator = re.searchAll(allocator, source);
+    var iterator = try re.searchAll(allocator, source);
     defer iterator.deinit(allocator);
 
     var i: usize = 0;
