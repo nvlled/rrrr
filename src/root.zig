@@ -5,6 +5,8 @@ const ArrayList = std.ArrayList;
 const tryAlloc = @import("./alloc.zig").@"try";
 var stderr = std.fs.File.stderr().writer(&.{});
 
+pub const String = []const u8;
+
 pub const MatchResult = struct {
     // position within the source string
     pos: usize,
@@ -465,7 +467,7 @@ pub const Regex = union(enum) {
         };
     }
 
-    pub fn times(count: usize, re: RE) Self {
+    pub fn repeat(count: usize, re: RE) Self {
         return .{
             .repetition = .{
                 .re = re,
@@ -503,6 +505,250 @@ pub const Regex = union(enum) {
     pub fn capture(re: RE) Self {
         return .{ .captured = re };
     }
+
+    /// Regex.Builder is a set of constructor functions
+    /// that allocates on the heap. The constructors
+    /// are similar to stack-allocated Regex constructors,
+    /// except with Regex.Builder:
+    ///   - the slice []const RE is copied shallowly
+    ///   - all *Regex arguments are never copied
+    ///   - `Builder.literal()` also copies the string argument
+    ///
+    /// Builder.literal() copies the string because the
+    /// regex is meant to be recursively free'd
+    /// afterwards, and this includes the string.
+    /// If the string is already heap-allocated,
+    /// use Builder.literalFrom() to avoid copying.
+    ///
+    /// Note: All regex returned form these constructor
+    /// functions must be free'd with Regex.recursiveFree()
+    /// afterwards.
+    ///
+    /// Note: Avoid mixing Regex and Builder constructors
+    /// in one regex tree expression, as this will make it
+    /// difficult to distinguish which  ones need to be deallocated.
+    pub const Builder = struct {
+        allocator: Allocator,
+
+        pub fn init(allocator: Allocator) @This() {
+            return .{
+                .allocator = allocator,
+            };
+        }
+
+        /// Note: This copies the string argument. Use `Builder.literalFrom`
+        // to avoid copying the string.
+        pub fn literal(self: @This(), value: []const u8) RE {
+            const value_copy = tryAlloc(self.allocator.dupe(u8, value));
+            return Regex.literal(value_copy).dupe(self.allocator);
+        }
+
+        /// Note: The string argument must be allocated on
+        /// the heap. If not, use `Builder.literal` instead.
+        pub fn literalFrom(self: @This(), value: []const u8) RE {
+            return Regex.literal(value).dupe(self.allocator);
+        }
+
+        pub fn either(self: @This(), args: []const RE) RE {
+            const args_copy = tryAlloc(self.allocator.dupe(RE, args));
+            return Regex.either(args_copy).dupe(self.allocator);
+        }
+
+        pub fn eitherTwo(self: @This(), arg1: RE, arg2: RE) RE {
+            const args = tryAlloc(self.allocator.dupe(RE, &.{ arg1, arg2 }));
+            return Regex.either(args).dupe(self.allocator);
+        }
+
+        pub fn eitherThree(self: @This(), arg1: RE, arg2: RE, arg3: RE) RE {
+            const args = tryAlloc(self.allocator.dupe(RE, &.{ arg1, arg2, arg3 }));
+            return Regex.either(args).dupe(self.allocator);
+        }
+
+        pub fn exceptChar(self: @This(), value: []const u8) RE {
+            return Regex.exceptChar(value).recursiveCopy(self.allocator);
+        }
+
+        pub fn range(self: @This(), start: u8, end: u8) RE {
+            return Regex.range(start, end).recursiveCopy(self.allocator);
+        }
+
+        pub fn @"!range"(self: @This(), start: u8, end: u8) RE {
+            return Regex.@"!range"(start, end).recursiveCopy(self.allocator);
+        }
+
+        pub fn charset(self: @This(), set: BitSet) RE {
+            return Regex.charset(set).recursiveCopy(self.allocator);
+        }
+
+        pub fn optional(self: @This(), re: RE) RE {
+            return Regex.optional(re).dupe(self.allocator);
+        }
+
+        pub fn @"zeroOrMore?"(self: @This(), re: RE) RE {
+            return Regex.@"zeroOrMore?"(re).dupe(self.allocator);
+        }
+
+        pub fn zeroOrMore(self: @This(), re: RE) RE {
+            return Regex.zeroOrMore(re).dupe(self.allocator);
+        }
+
+        pub fn oneOrMore(self: @This(), re: RE) RE {
+            return Regex.oneOrMore(re).dupe(self.allocator);
+        }
+
+        pub fn @"oneOrMore?"(self: @This(), re: RE) RE {
+            return Regex.@"oneOrMore?"(re).dupe(self.allocator);
+        }
+
+        pub fn atLeast(self: @This(), count: usize, re: RE) RE {
+            return Regex.atLeast(count, re).dupe(self.allocator);
+        }
+
+        pub fn @"atLeast?"(self: @This(), count: usize, re: RE) RE {
+            return Regex.@"atLeast?"(count, re).dupe(self.allocator);
+        }
+
+        pub fn atMost(self: @This(), count: usize, re: RE) RE {
+            return Regex.atMost(count, re).dupe(self.allocator);
+        }
+
+        pub fn @"atMost?"(self: @This(), count: usize, re: RE) RE {
+            return Regex.@"atMost?"(count, re).dupe(self.allocator);
+        }
+
+        pub fn around(self: @This(), min: usize, max: usize, re: RE) RE {
+            return Regex.around(min, max, re).dupe(self.allocator);
+        }
+
+        pub fn @"around?"(self: @This(), min: usize, max: usize, re: RE) RE {
+            return Regex.@"around?"(min, max, re).dupe(self.allocator);
+        }
+
+        pub fn repeat(self: @This(), count: usize, re: RE) RE {
+            return Regex.repeat(count, re).dupe(self.allocator);
+        }
+
+        pub inline fn @"*"(self: @This(), re: RE) RE {
+            return self.zeroOrMore(re);
+        }
+
+        pub inline fn @"+"(self: @This(), re: RE) RE {
+            return self.@"oneOrMore?"(re);
+        }
+
+        pub inline fn @"*?"(self: @This(), re: RE) RE {
+            return self.@"zeroOrMore?"(re);
+        }
+
+        pub inline fn @"+?"(self: @This(), re: RE) RE {
+            return self.oneOrMore(re);
+        }
+
+        pub fn backref(self: @This(), index: usize) RE {
+            return Regex.backref(index).dupe(self.allocator);
+        }
+
+        pub fn concat(self: @This(), args: []const RE) RE {
+            const args_copy = tryAlloc(self.allocator.dupe(RE, args));
+            return Regex.concat(args_copy).dupe(self.allocator);
+        }
+
+        pub fn concatTwo(self: @This(), arg1: RE, arg2: RE) RE {
+            const args = tryAlloc(self.allocator.dupe(RE, &.{ arg1, arg2 }));
+            return Regex.concat(args).dupe(self.allocator);
+        }
+
+        pub fn concatTwoThree(self: @This(), arg1: RE, arg2: RE, arg3: RE) RE {
+            const args = tryAlloc(self.allocator.dupe(RE, &.{ arg1, arg2, arg3 }));
+            return Regex.concat(args).dupe(self.allocator);
+        }
+
+        pub fn capture(self: @This(), re: RE) RE {
+            return Regex.capture(re).dupe(self.allocator);
+        }
+
+        // Below are versions of constructors  that take string
+        // arguments directly, for convenience.
+
+        pub fn eitherS(self: @This(), str_args: []const String) RE {
+            const args = tryAlloc(self.allocator.alloc(RE, str_args.len));
+            for (0..str_args.len) |i| {
+                args[i] = Regex.literal(str_args[i]).recursiveCopy(self.allocator);
+            }
+            return Regex.either(args).dupe(self.allocator);
+        }
+
+        pub fn eitherTwoS(self: @This(), arg1: String, arg2: String) RE {
+            return self.eitherS(&.{ arg1, arg2 });
+        }
+
+        pub fn eitherThreeS(self: @This(), arg1: String, arg2: String, arg3: String) RE {
+            return self.eitherS(&.{ arg1, arg2, arg3 });
+        }
+
+        pub fn optionalS(self: @This(), str: String) RE {
+            return Regex.optional(&.literal(str)).dupe(self.allocator);
+        }
+
+        pub fn zeroOrMoreS(self: @This(), str: String) RE {
+            return Regex.zeroOrMore(&.literal(str)).recursiveCopy(self.allocator);
+        }
+
+        pub fn @"zeroOrMoreS?"(self: @This(), str: String) RE {
+            return Regex.@"zeroOrMore?"(&.literal(str)).recursiveCopy(self.allocator);
+        }
+
+        pub fn oneOrMoreS(self: @This(), str: String) RE {
+            return Regex.oneOrMore(&.literal(str)).recursiveCopy(self.allocator);
+        }
+
+        pub fn @"oneOrMoreS?"(self: @This(), str: String) RE {
+            return Regex.@"oneOrMore?"(&.literal(str)).recursiveCopy(self.allocator);
+        }
+
+        pub fn atLeastS(self: @This(), count: usize, str: String) RE {
+            return Regex.atLeast(count, &.literal(str)).recursiveCopy(self.allocator);
+        }
+
+        pub fn @"atLeastS?"(self: @This(), count: usize, str: String) RE {
+            return Regex.@"atLeast?"(count, &.literal(str)).recursiveCopy(self.allocator);
+        }
+
+        pub fn atMostS(self: @This(), count: usize, str: String) RE {
+            return Regex.atMost(count, str).recursiveCopy(self.allocator);
+        }
+
+        pub fn @"atMostS?"(self: @This(), count: usize, str: String) RE {
+            return Regex.@"atMost?"(count, str).recursiveCopy(self.allocator);
+        }
+
+        pub fn aroundS(self: @This(), min: usize, max: usize, str: String) RE {
+            return Regex.around(min, max, str).recursiveCopy(self.allocator);
+        }
+
+        pub fn @"aroundS?"(self: @This(), min: usize, max: usize, str: String) RE {
+            return Regex.@"around?"(min, max, str).recursiveCopy(self.allocator);
+        }
+
+        pub fn repeatS(self: @This(), count: usize, str: String) Self {
+            return Regex.repeat(count, str).recursiveCopy(self.allocator);
+        }
+
+        pub fn concatS(self: @This(), str_args: []const String) RE {
+            const args = tryAlloc(self.allocator.alloc(RE, str_args.len));
+            for (0..str_args.len) |i| {
+                args[i] = Regex.literal(str_args[i]).recursiveCopy(self.allocator);
+            }
+            return Regex.concat(args).dupe(self.allocator);
+        }
+        pub fn concatTwoS(self: @This(), arg1: String, arg2: String) RE {
+            return self.concatS(&.{ arg1, arg2 });
+        }
+
+        pub fn concatThreeS(self: @This(), arg1: String, arg2: String, arg3: String) RE {
+            return self.concatS(&.{ arg1, arg2, arg3 });
+        }
+    };
 
     pub fn equals(re1: RE, re2: RE) bool {
         if (std.meta.activeTag(re1.*) != std.meta.activeTag(re2.*)) {
@@ -1231,10 +1477,10 @@ const Simplifier = struct {
     //   note:
     //     - zeroOrMore(x) == repeat(0, null, x)
     //     - atEleast(n, x) == repeat(n, null, x)
-    //     - times(n, x) == repeat(n, n, x)
+    //     - repeat(n, x) == repeat(n, n, x)
     //
     // - repeat(m, n, none) -> none
-    // - times(2, "a") -> "aa"
+    // - repeat(2, "a") -> "aa"
     // - atLeast(2, "foo") -> concat("foofoo", zeroOrMore("foo"))
     // - atLeast(3, x) -> concat(x, x, x, zeroOrMore(x))
 
@@ -1363,16 +1609,11 @@ const Simplifier = struct {
                     }
                 }
 
-                const concat_args = &.{
-                    Regex.literal(common_prefix).dupe(allocator),
-                    Regex.either(
-                        tryAlloc(either_args.toOwnedSlice(allocator)),
-                    ).dupe(allocator),
-                };
-
-                return Regex.concat(
-                    tryAlloc(allocator.dupe(RE, concat_args)),
-                ).dupe(allocator);
+                const b: Regex.Builder = .init(allocator);
+                return b.concat(&.{
+                    b.literalFrom(common_prefix),
+                    b.either(either_args.items),
+                });
             },
 
             .repetition => |val| {
@@ -1440,10 +1681,14 @@ const Simplifier = struct {
                         // TODO: check first if the string to be created is too large
                         const str = repeatString(allocator, val.min, copy.re.literal_string);
 
-                        return Regex.concat(tryAlloc(allocator.dupe(RE, &.{
-                            Regex.literal(str).dupe(allocator),
-                            Regex.zeroOrMore(copy.re).dupe(allocator),
-                        }))).dupe(allocator);
+                        const b: Regex.Builder = .init(allocator);
+                        return b.concat(&.{
+                            b.literalFrom(str),
+                            if (val.greedy)
+                                b.zeroOrMore(copy.re)
+                            else
+                                b.@"zeroOrMore?"(copy.re),
+                        });
                     },
                     else => {
                         if (val.max) |max| if (val.min == max and max == 1)
@@ -1478,9 +1723,8 @@ const Simplifier = struct {
                             );
                         } else copy.re.recursiveFree(allocator);
 
-                        return Regex.concat(
-                            tryAlloc(args.toOwnedSlice(allocator)),
-                        ).dupe(allocator);
+                        const b: Regex.Builder = .init(allocator);
+                        return b.concat(args.items);
                     },
                 }
             },
@@ -1586,20 +1830,20 @@ const Simplifier = struct {
                     // it would be a bit bigger, but also easier to
                     // combine with other regexes for simplification
                     2...16 => |len| {
-                        var buf: ArrayList(RE) = tryAlloc(
+                        var args: ArrayList(RE) = tryAlloc(
                             ArrayList(RE).initCapacity(allocator, len),
                         );
-                        defer buf.deinit(allocator);
+                        defer args.deinit(allocator);
 
                         var iter = set.iterator(.{});
                         while (iter.next()) |n| {
                             const ch: u8 = @intCast(n);
                             const lit = Regex.literal(&.{ch}).recursiveCopy(allocator);
-                            tryAlloc(buf.append(allocator, lit));
+                            tryAlloc(args.append(allocator, lit));
                         }
 
-                        const args = tryAlloc(buf.toOwnedSlice(allocator));
-                        return Regex.either(args).dupe(allocator);
+                        const b: Regex.Builder = .init(allocator);
+                        return b.either(args.items);
                     },
                     else => re.recursiveCopy(allocator),
                 };
@@ -1705,9 +1949,8 @@ const Simplifier = struct {
                                 tryAlloc(args.append(allocator, arg));
                             }
 
-                            accumulator = Regex.either(
-                                tryAlloc(args.toOwnedSlice(allocator)),
-                            ).dupe(allocator);
+                            const b: Regex.Builder = .init(allocator);
+                            accumulator = b.either(args.items);
                         },
                         else => return null,
                     }
@@ -1731,9 +1974,8 @@ const Simplifier = struct {
                                 tryAlloc(args.append(allocator, arg));
                             }
 
-                            accumulator = Regex.either(
-                                tryAlloc(args.toOwnedSlice(allocator)),
-                            ).dupe(allocator);
+                            const b: Regex.Builder = .init(allocator);
+                            accumulator = b.either(args.items);
                         },
                         .alternation => |choices| {
                             const len = acc_choices.len + choices.len;
@@ -1755,9 +1997,8 @@ const Simplifier = struct {
                                 }
                             }
 
-                            accumulator = Regex.either(
-                                tryAlloc(args.toOwnedSlice(allocator)),
-                            ).dupe(allocator);
+                            const b: Regex.Builder = .init(allocator);
+                            accumulator = b.either(args.items);
                         },
                         else => return null,
                     }
@@ -2293,7 +2534,7 @@ test {
 
         .{
             .re = &.concat(&.{
-                &.times(4, &.word),
+                &.repeat(4, &.word),
                 &.@"!word",
                 &.@"oneOrMore?"(&.digit),
             }),
@@ -2303,7 +2544,7 @@ test {
 
         .{
             .re = &.concat(&.{
-                &.times(4, &.word),
+                &.repeat(4, &.word),
                 &.@"!word",
                 &.@"oneOrMore?"(&.digit),
                 &.@"!digit",
