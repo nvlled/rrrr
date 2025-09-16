@@ -1044,11 +1044,10 @@ pub const Regex = union(enum) {
 
                 var hasMore = true;
                 var running: std.atomic.Value(bool) = .init(true);
-                while (hasMore) {
-                    var processed: usize = 0;
+                var sub_result: ?MatchResult = null;
+                while (hasMore and sub_result == null) {
                     for (0..batch.len) |j| {
                         if (iterator.next(allocator)) |m| {
-                            processed += 1;
                             var sub_state = state.sliceInput(m.len);
                             sub_state.running = &running;
 
@@ -1066,23 +1065,31 @@ pub const Regex = union(enum) {
                         } else hasMore = false;
                     }
 
-                    for (0..processed) |j| {
+                    for (0..batch.len) |j| {
                         batch[j].wg.wait();
 
-                        if (batch[j].result) |m| {
+                        // NOTE: it should always wait for all the threads
+                        // to finish before returning, otherwise the thread pool
+                        // will refer to an invalidated pointers to wait groups.
+                        // What this means is:
+                        //    it should NOT break or return inside this loop
+
+                        if (sub_result == null) if (batch[j].result) |m| {
                             running.store(false, .unordered);
-                            return .{
+                            sub_result = .{
                                 .pos = result.pos,
                                 .len = result.len + m.len,
                                 .capture = m.capture,
                             };
-                        }
+                        };
 
                         batch[j].wg.reset();
                     }
+
+                    if (!state_arg.running.load(.unordered)) return null;
                 }
 
-                return null;
+                return sub_result;
             },
 
             .alternation => {
@@ -1092,12 +1099,14 @@ pub const Regex = union(enum) {
                 var thread_pool = state_arg.thread_pool;
                 var wg: std.Thread.WaitGroup = .{};
                 var sub_result: ?MatchResult = null;
+                var running: std.atomic.Value(bool) = .init(true);
 
                 while (iterator.next(allocator)) |m| {
                     if (!state_arg.running.load(.unordered)) return null;
-                    if (sub_result != null) break;
 
-                    const sub_state = state.sliceInput(m.len);
+                    var sub_state = state.sliceInput(m.len);
+                    sub_state.running = &running;
+
                     thread_pool.spawnWg(
                         &wg,
                         matchConcatWrapped,
@@ -1109,13 +1118,16 @@ pub const Regex = union(enum) {
                             &sub_result,
                         },
                     );
+
+                    if (sub_result != null) {
+                        running.store(false, .unordered);
+                        break;
+                    }
                 }
 
-                // Wait for all sub-matches to finish.
-                // Ideally this should just wait for just one
-                // one match to occur, but that would fail
-                // if regex isn't normalized and there's
-                // a common prefix between the choices.
+                // NOTE: it should always wait for all the threads
+                // to finish before returning, otherwise the thread pool
+                // will refer to an invalidated pointer to the WaitGroup.
                 wg.wait();
 
                 return if (sub_result) |m| .{
@@ -1180,7 +1192,13 @@ pub const Regex = union(enum) {
         }
     }
 
-    pub fn search(self: Self, allocator: Allocator, input: []const u8) std.Thread.SpawnError!?MatchResult {
+    pub fn search(self: Self, allocator_arg: Allocator, input: []const u8) std.Thread.SpawnError!?MatchResult {
+        var ts_allocator: std.heap.ThreadSafeAllocator = .{
+            .mutex = .{},
+            .child_allocator = allocator_arg,
+        };
+        const allocator = ts_allocator.allocator();
+
         var pos: usize = 0;
         if (getLiteralPrefix(&self)) |prefix| {
             if (std.mem.indexOf(u8, input, prefix)) |i| pos = i;
@@ -1218,15 +1236,23 @@ pub const Regex = union(enum) {
         re: RE,
         prefix: ?[]const u8,
         state: MatchState,
+        ts_allocator: *std.heap.ThreadSafeAllocator,
 
         _last_pos: usize = 0,
         _last_len: usize = 0,
 
         fn init(
             re: RE,
-            allocator: Allocator,
+            allocator_arg: Allocator,
             source: []const u8,
         ) !SearchIterator {
+            var ts_allocator = tryAlloc(allocator_arg.create(std.heap.ThreadSafeAllocator));
+            ts_allocator.* = .{
+                .mutex = .{},
+                .child_allocator = allocator_arg,
+            };
+            const allocator = ts_allocator.allocator();
+
             const running = tryAlloc(allocator.create(std.atomic.Value(bool)));
 
             const thread_pool = tryAlloc(allocator.create(std.Thread.Pool));
@@ -1250,6 +1276,7 @@ pub const Regex = union(enum) {
                     .running = running,
                     .thread_pool = thread_pool,
                 },
+                .ts_allocator = ts_allocator,
             };
         }
 
@@ -1261,6 +1288,8 @@ pub const Regex = union(enum) {
 
             self.state.thread_pool.deinit();
             allocator.destroy(self.state.thread_pool);
+
+            allocator.destroy(self.ts_allocator);
         }
 
         // Caller should result.freeCaptures() if any capture was done
@@ -1343,7 +1372,6 @@ pub const Regex = union(enum) {
 
         const Item = struct {
             match: MatchResult,
-            _replacer: *ReplaceIterator,
 
             pub inline fn freeCaptures(self: *@This()) void {
                 self.match.freeCaptures();
@@ -1380,7 +1408,6 @@ pub const Regex = union(enum) {
 
             return .{
                 .match = m,
-                ._replacer = self,
             };
         }
 
