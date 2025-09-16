@@ -2175,11 +2175,19 @@ const Formatter = struct {
 
 const MatchIterator = union(enum) {
     greedy: GreedyIterator,
+    literal_greedy: LiteralGreedyIterator,
     lazy: LazyIterator,
     alternation: AlternationIterator,
     single: SingleIterator,
 
     const Self = @This();
+
+    const NextState = enum {
+        init,
+        loop,
+        last,
+        done,
+    };
 
     fn init(
         re: RE,
@@ -2187,21 +2195,32 @@ const MatchIterator = union(enum) {
     ) Self {
         return switch (re.*) {
             .repetition => |val| {
-                return if (val.greedy) .{
-                    .greedy = GreedyIterator{
-                        .re = val.re,
-                        .state = state,
-                        .min = val.min,
-                        .max = val.max,
-                    },
-                } else .{
-                    .lazy = LazyIterator{
-                        .re = val.re,
-                        .state = state,
-                        .min = val.min,
-                        .max = val.max,
-                    },
-                };
+                return if (val.greedy)
+                    switch (val.re.*) {
+                        .literal_string => |s| .{
+                            .literal_greedy = LiteralGreedyIterator{
+                                .string = s,
+                                .state = state,
+                                .min = val.min,
+                                .max = val.max,
+                            },
+                        },
+                        else => .{ .greedy = GreedyIterator{
+                            .re = val.re,
+                            .state = state,
+                            .min = val.min,
+                            .max = val.max,
+                        } },
+                    }
+                else
+                    .{
+                        .lazy = LazyIterator{
+                            .re = val.re,
+                            .state = state,
+                            .min = val.min,
+                            .max = val.max,
+                        },
+                    };
             },
             .alternation => |args| .{
                 .alternation = .{
@@ -2235,34 +2254,42 @@ const MatchIterator = union(enum) {
         state: MatchState,
         pos: usize = 0,
         len: usize = 0,
-        iterations: usize = 0,
         min: usize,
         max: ?usize,
-        first: bool = true,
+        iterations: usize = 0,
+        next_state: NextState = .init,
 
         fn deinit(_: *@This(), _: Allocator) void {}
 
         fn next(self: *@This(), allocator: Allocator) ?MatchResult {
-            const state = self.state;
+            return switch (self.next_state) {
+                .init => self.nextInit(allocator),
+                .loop => self.nextLoop(allocator),
+                .last => self.nextLast(),
+                .done => self.nextDone(),
+            };
+        }
 
-            if (self.first) {
-                self.first = false;
+        fn nextInit(self: *@This(), allocator: Allocator) ?MatchResult {
+            self.pos = self.state.input.pos;
 
-                // skip first few matches until min
-                while (self.iterations < self.min) {
-                    if (self.re.match(allocator, state)) |m| {
-                        self.pos = m.pos;
-                        self.len = m.len;
-                        self.iterations += 1;
-                    } else return null;
-                }
-
-                return .{ .pos = self.pos, .len = self.len };
+            // skip first few matches until min
+            while (self.iterations < self.min) {
+                if (self.re.match(allocator, self.state)) |m| {
+                    self.pos = m.pos;
+                    self.len = m.len;
+                    self.iterations += 1;
+                } else return null;
             }
 
-            const max = self.max orelse std.math.maxInt(usize) - 1;
+            self.next_state = .loop;
+            return .{ .pos = self.pos, .len = self.len };
+        }
 
-            if (self.iterations <= max) {
+        fn nextLoop(self: *@This(), allocator: Allocator) ?MatchResult {
+            const state = self.state;
+
+            if (self.iterations <= self.max orelse std.math.maxInt(usize)) {
                 const sub_state = state.sliceInput(self.len);
                 if (self.re.match(allocator, sub_state)) |m| {
                     self.len += m.len;
@@ -2271,14 +2298,23 @@ const MatchIterator = union(enum) {
                 }
             }
 
+            return self.nextLast();
+        }
+
+        fn nextLast(self: *@This()) ?MatchResult {
+            defer self.next_state = .done;
+
             // match zero string
-            if (self.iterations <= max + 1) {
+            if (self.min == 0) {
                 self.iterations += 1;
-                self.pos = state.input.pos;
-                self.len = 0;
-                return .{ .pos = self.pos, .len = self.len };
+                return .{ .pos = self.pos, .len = 0 };
             }
 
+            return null;
+        }
+
+        fn nextDone(self: *@This()) ?MatchResult {
+            self.next_state = .done;
             return null;
         }
     };
@@ -2290,49 +2326,155 @@ const MatchIterator = union(enum) {
         len: usize = 0,
         min: usize,
         max: ?usize = null,
-        first: bool = true,
         lengths: std.ArrayListUnmanaged(usize) = .{},
+        next_state: NextState = .init,
 
         fn deinit(self: *@This(), allocator: Allocator) void {
             self.lengths.deinit(allocator);
         }
 
         fn next(self: *@This(), allocator: Allocator) ?MatchResult {
+            return switch (self.next_state) {
+                .init => self.nextInit(allocator),
+                .loop => self.nextLoop(),
+                .last => self.nextEmpty(),
+                .done => self.nextDone(),
+            };
+        }
+
+        fn nextInit(self: *@This(), allocator: Allocator) ?MatchResult {
             const state = self.state;
+            var n: usize = 0;
 
-            if (self.first) {
-                self.first = false;
+            self.pos = state.input.pos;
 
-                var n: usize = 0;
-                var lengths = &self.lengths;
-
-                // skip first few matches until min
-                while (n < self.min) {
-                    if (self.re.match(allocator, state)) |m| {
-                        self.pos = m.pos;
+            // skip first few matches until min
+            var len: usize = 0;
+            if (self.min > 0) {
+                while (n < self.min - 1) {
+                    if (self.re.match(allocator, state.sliceInput(len))) |m| {
+                        len += m.len;
                         n += 1;
-                    } else return null;
-                }
-
-                if (n == 0) tryAlloc(lengths.append(allocator, 0));
-
-                while (true) {
-                    if (self.max) |max| {
-                        if (lengths.items.len >= max) break;
+                    } else {
+                        return self.nextDone();
                     }
-                    if (self.re.match(allocator, state.sliceInput(self.len))) |m| {
-                        self.len += m.len;
-                        if (lengths.items.len == 0) self.pos = m.pos;
-                        tryAlloc(lengths.append(allocator, self.len));
-                    } else break;
                 }
             }
 
+            while (true) {
+                if (self.max) |max| if (n >= max) break;
+
+                if (self.re.match(allocator, state.sliceInput(len))) |m| {
+                    n += 1;
+                    len += m.len;
+                    tryAlloc(self.lengths.append(allocator, m.pos - self.pos + m.len));
+                } else break;
+            }
+
+            return self.nextLoop();
+        }
+
+        fn nextLoop(self: *@This()) ?MatchResult {
+            self.next_state = .loop;
             if (self.lengths.pop()) |len| {
-                self.len = len;
+                return .{ .pos = self.pos, .len = len };
+            }
+
+            return if (self.min == 0)
+                self.nextEmpty()
+            else
+                self.nextDone();
+        }
+
+        fn nextEmpty(self: *@This()) ?MatchResult {
+            self.next_state = .done;
+            return .{ .pos = self.pos, .len = 0 };
+        }
+
+        fn nextDone(self: *@This()) ?MatchResult {
+            self.next_state = .done;
+            return null;
+        }
+    };
+
+    const LiteralGreedyIterator = struct {
+        string: []const u8,
+        state: MatchState,
+        pos: usize = 0,
+        len: usize = 0,
+        min: usize,
+        max: ?usize = null,
+        next_state: NextState = .init,
+
+        fn deinit(_: *@This(), _: Allocator) void {}
+
+        fn next(self: *@This(), allocator: Allocator) ?MatchResult {
+            return switch (self.next_state) {
+                .init => self.nextInit(allocator),
+                .loop => self.nextLoop(),
+                .last => self.nextLast(),
+                .done => self.nextDone(),
+            };
+        }
+
+        fn nextInit(self: *@This(), allocator: Allocator) ?MatchResult {
+            if (self.string.len == 0) {
+                return self.nextLast();
+            }
+
+            const lit = Regex.literal(self.string);
+            const state = self.state;
+            var n: usize = 0;
+
+            self.pos = state.input.pos;
+
+            // skip first few matches until min
+            var pos: usize = 0;
+            while (n < self.min) {
+                if (lit.match(allocator, state.sliceInput(pos))) |m| {
+                    pos += m.len;
+                    n += 1;
+                } else {
+                    self.next_state = .done;
+                    return null;
+                }
+            }
+
+            if (n < self.min) {
+                self.next_state = .done;
+                return null;
+            }
+
+            while (true) {
+                if (self.max) |max| if (n >= max) break;
+
+                if (lit.match(allocator, state.sliceInput(self.len))) |m| {
+                    self.len += m.len;
+                    n += 1;
+                } else break;
+            }
+
+            self.next_state = .loop;
+            return self.nextLoop();
+        }
+
+        fn nextLoop(self: *@This()) ?MatchResult {
+            const left = self.len / self.string.len;
+            if (left > self.min) {
+                defer self.len -= self.string.len;
                 return .{ .pos = self.pos, .len = self.len };
             }
 
+            self.next_state = .last;
+            return self.nextLast();
+        }
+
+        fn nextLast(self: *@This()) ?MatchResult {
+            self.next_state = .done;
+            return .{ .pos = self.pos, .len = self.len };
+        }
+
+        fn nextDone(_: *@This()) ?MatchResult {
             return null;
         }
     };
@@ -3368,7 +3510,8 @@ test "match captured iterator" {
             j += 1;
         }
     }
-    try testing.expect(i > 0);
+
+    try testing.expect(i == expected.len);
 }
 
 test "replace iteratively" {
