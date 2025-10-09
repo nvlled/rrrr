@@ -33,13 +33,13 @@ pub const MatchResult = struct {
         pos: usize,
         next: ?*const Capture,
 
-        fn string(self: *const Capture, source: []const u8) []const u8 {
+        pub fn string(self: *const Capture, source: []const u8) []const u8 {
             const i = self.pos;
             return source[i .. i + self.len];
         }
 
         // Returns the number of captures in the list.
-        fn count(self: *const Capture) usize {
+        pub fn count(self: *const Capture) usize {
             var n: usize = 0;
             var current: ?*const Capture = self;
 
@@ -50,27 +50,6 @@ pub const MatchResult = struct {
             }
 
             return n;
-        }
-
-        // Copies all captures in the linked-list.
-        // If the allocator is not an ArenaAllocator,
-        // caller must free returned all captures, either manually
-        // with `Capture.freeAll()`.
-        fn dupeAll(self: *const Capture, allocator: Allocator) *Capture {
-            const result = tryAlloc(allocator.create(MatchResult.Capture));
-            result.* = self.*;
-
-            var cur_clone: *Capture = result;
-            var cur_original: *const Capture = self;
-            while (cur_original.next) |next| {
-                const clone = tryAlloc(allocator.create(MatchResult.Capture));
-                clone.* = next.*;
-                cur_clone.next = clone;
-                cur_clone = clone;
-                cur_original = next;
-            }
-
-            return result;
         }
 
         // Frees all captures in the linked-list.
@@ -101,20 +80,17 @@ pub const MatchResult = struct {
             return slice;
         }
 
-        // Returns a new (copy) of the list
-        // with the two args appended together.
-        // Caller must free the returned capture list.
+        // Connects the two list.
+        // Return right arg if left is null,
+        // otherwise return left.
+        // No copy is made. May modify the last item of left.
         fn connect(
-            arena: Allocator,
             left_arg: ?*const Capture,
             right_arg: ?*const Capture,
         ) ?*const Capture {
-            if (left_arg == null) {
-                return right_arg;
-            }
-            const left = left_arg.?.dupeAll(arena);
+            const left = left_arg orelse return right_arg;
 
-            var tail: *Capture = left;
+            var tail: *Capture = @constCast(left);
             while (tail.next) |c| {
                 tail = @constCast(c);
             }
@@ -141,12 +117,6 @@ const MatchState = struct {
     input: MatchInput,
     running: *std.atomic.Value(bool),
     thread_pool: ?*std.Thread.Pool,
-
-    // Currently only used for intermediate captures,
-    // particularly, for the `dupeAll()` and `connect()` methods
-    // of `MatchResult.Capture`.
-    // Main allocator will be used for returned captures
-    arena: *std.heap.ArenaAllocator,
 
     // Temporary captures while the search is still ongoing,
     // intended to be allocated on the stack memory.
@@ -209,7 +179,6 @@ const MatchState = struct {
         return .{
             .capture = self.capture,
             .input = self.input.slice(offset),
-            .arena = self.arena,
             .running = self.running,
             .thread_pool = self.thread_pool,
         };
@@ -1002,13 +971,11 @@ pub const Regex = union(enum) {
 
                     result.len += m.len;
 
-                    const arena = state.arena.allocator();
                     if (current_cap) |cap| {
-                        const c = cap.dupeAll(arena);
-                        cap.next = c;
+                        cap.next = cap;
                     } else if (m.capture) |cap| {
-                        current_cap = cap.dupeAll(arena);
-                        result.capture = current_cap;
+                        current_cap = @constCast(cap);
+                        result.capture = cap;
                     }
 
                     state = state.sliceInput(m.len);
@@ -1051,24 +1018,22 @@ pub const Regex = union(enum) {
                             .prev = if (state.capture) |c| c else null,
                         },
                         .input = state.input.slice(m.len),
-                        .arena = state.arena,
                         .running = state.running,
                         .thread_pool = state.thread_pool,
                     };
 
                     if (matchConcat(allocator, sub_state, rest_args)) |m2| {
-                        const arena = state.arena.allocator();
                         return .{
                             .pos = result.pos,
                             .len = result.len + m.len + m2.len,
                             .capture = blk: {
                                 const c = sub_state.capture.?;
-                                const head = c.toResult(arena);
+                                const head = c.toResult(allocator);
                                 head.next = MatchResult.Capture.connect(
-                                    arena,
                                     m.capture,
                                     m2.capture,
                                 );
+
                                 break :blk head;
                             },
                         };
@@ -1229,21 +1194,18 @@ pub const Regex = union(enum) {
                             .prev = if (state.capture) |c| c else null,
                         },
                         .input = state.input.slice(m.len),
-                        .arena = state.arena,
                         .running = state.running,
                         .thread_pool = state.thread_pool,
                     };
 
                     if (matchConcat(allocator, sub_state, rest_args)) |m2| {
-                        const arena = state.arena.allocator();
                         return .{
                             .pos = result.pos,
                             .len = result.len + m.len + m2.len,
                             .capture = blk: {
                                 const c = sub_state.capture.?;
-                                const head = c.toResult(arena);
+                                const head = c.toResult(allocator);
                                 head.next = MatchResult.Capture.connect(
-                                    arena,
                                     m.capture,
                                     m2.capture,
                                 );
@@ -1286,24 +1248,16 @@ pub const Regex = union(enum) {
             if (std.mem.indexOf(u8, input, prefix)) |i| pos = i;
         }
 
-        var arena = std.heap.ArenaAllocator.init(allocator);
-        defer arena.deinit();
-
         var running: std.atomic.Value(bool) = .init(true);
         const state: MatchState = .{
             .running = &running,
             .input = .{ .value = input, .pos = pos },
             .capture = null,
-            .arena = &arena,
             .thread_pool = options.thread_pool,
         };
 
-        var result = self.match(allocator, state);
+        const result = self.match(allocator, state);
         running.store(true, .unordered);
-
-        if (result) |*m| if (m.capture) |c| {
-            m.capture = c.dupeAll(allocator);
-        };
 
         return result;
     }
@@ -1320,15 +1274,16 @@ pub const Regex = union(enum) {
         re: RE,
         prefix: ?[]const u8,
         state: MatchState,
+        capture: ?*const MatchResult.Capture = null,
 
         _last_pos: usize = 0,
         _last_len: usize = 0,
+        _skipped_pos: struct { usize, usize } = .{ 0, 0 },
 
         pub fn reset(self: *@This()) void {
             self.state.input.pos = 0;
             self._last_pos = 0;
             self._last_len = 0;
-            _ = self.state.arena.reset(.retain_capacity);
         }
 
         pub fn init(
@@ -1339,9 +1294,6 @@ pub const Regex = union(enum) {
         ) !SearchIterator {
             const running = tryAlloc(allocator.create(std.atomic.Value(bool)));
 
-            const arena = tryAlloc(allocator.create(std.heap.ArenaAllocator));
-            arena.* = .init(allocator);
-
             return .{
                 .re = re,
                 .prefix = getLiteralPrefix(re),
@@ -1351,23 +1303,35 @@ pub const Regex = union(enum) {
                         .pos = 0,
                     },
                     .capture = null,
-                    .arena = arena,
                     .running = running,
                     .thread_pool = options.thread_pool,
                 },
             };
         }
 
-        fn deinit(self: *@This(), allocator: Allocator) void {
+        pub fn deinit(self: *@This(), allocator: Allocator) void {
             allocator.destroy(self.state.running);
-
-            self.state.arena.deinit();
-            allocator.destroy(self.state.arena);
+            if (self.capture) |c| {
+                c.freeAll(allocator);
+                self.capture = null;
+            }
         }
 
-        // Caller should result.freeCaptures() if any capture was done
-        fn next(self: *@This(), allocator: Allocator) ?MatchResult {
-            _ = self.state.arena.reset(.retain_capacity);
+        // the skipped string since the last match
+        pub fn skipped(self: *@This(), source: []const u8) []const u8 {
+            if (source.len == 0) return "";
+            const pos = self._skipped_pos;
+            return source[pos[0]..pos[1]];
+        }
+
+        // Previous MatchResult.Capture will be invalidated on next(),
+        // so if the capture needs to be stored, it should be duplicated
+        // before calling next().
+        pub fn next(self: *@This(), allocator: Allocator) ?MatchResult {
+            if (self.capture) |c| {
+                c.freeAll(allocator);
+                self.capture = null;
+            }
 
             const re = self.re;
 
@@ -1385,6 +1349,8 @@ pub const Regex = union(enum) {
                 defer self.state.running.store(false, .unordered);
 
                 if (re.match(allocator, self.state)) |m| {
+                    self.capture = m.capture;
+
                     if (m.pos == self._last_pos and
                         m.len == self._last_pos)
                     {
@@ -1393,10 +1359,10 @@ pub const Regex = union(enum) {
                         // so just break and skip to the end
                         // to avoid infinite loop
                         input.pos = input.value.len;
-                        m.freeCaptures(allocator);
                         return null;
                     }
 
+                    self._skipped_pos = .{ self._last_pos + self._last_len, m.pos };
                     self._last_pos = m.pos;
                     self._last_len = m.len;
                     self.state.input = self.state.input.slice(m.len);
@@ -1452,14 +1418,6 @@ pub const Regex = union(enum) {
         _match_start: usize = 0,
         _match_end: usize = 0,
 
-        const Item = struct {
-            match: MatchResult,
-
-            pub inline fn freeCaptures(self: *@This()) void {
-                self.match.freeCaptures();
-            }
-        };
-
         pub fn init(
             re: RE,
             allocator: Allocator,
@@ -1489,7 +1447,7 @@ pub const Regex = union(enum) {
             }
         }
 
-        pub fn next(self: *@This(), allocator: Allocator) ?Item {
+        pub fn next(self: *@This(), allocator: Allocator) ?MatchResult {
             const m = self.search_iterator.next(allocator) orelse {
                 self._match_start = self.input.len;
                 return null;
@@ -1497,9 +1455,7 @@ pub const Regex = union(enum) {
             self._match_start = m.pos;
             self._match_end = m.pos + m.len;
 
-            return .{
-                .match = m,
-            };
+            return m;
         }
 
         pub fn write(self: *@This(), str: []const u8) std.Io.Writer.Error!void {
@@ -1534,8 +1490,9 @@ pub const Regex = union(enum) {
         self: RE,
         allocator: Allocator,
         input: []const u8,
+        options: SearchOptions,
     ) !ReplaceIterator {
-        return ReplaceIterator.init(self, allocator, input, .{});
+        return ReplaceIterator.init(self, allocator, input, options);
     }
 
     fn replaceAll(
@@ -1557,8 +1514,7 @@ pub const Regex = union(enum) {
         var replacer = try ReplaceIterator.init(self, allocator, input, options);
         defer replacer.deinit(allocator);
 
-        while (replacer.next(allocator)) |entry| {
-            defer entry.match.freeCaptures(allocator);
+        while (replacer.next(allocator)) |_| {
             try replacer.write(replacement);
         }
 
@@ -3582,17 +3538,25 @@ test "match captured iterator" {
         ),
         &.capture(&.literal("bc")),
     });
+
+    var thread_pool: std.Thread.Pool = undefined;
+    try thread_pool.init(.{ .allocator = allocator });
+    defer thread_pool.deinit();
+
     const source = "aabcabc   aaabcasdjfabciasofaaaabca";
-    var iterator = try re.searchAll(allocator, source);
+    var iterator = try re.searchAllWith(allocator, source, .{
+        .thread_pool = &thread_pool,
+    });
     defer iterator.deinit(allocator);
 
     // test if reset works
-    while (iterator.next(testing.allocator)) |_| {}
+    while (iterator.next(allocator)) |_| {}
     iterator.reset();
 
     var i: usize = 0;
     while (iterator.next(testing.allocator)) |m| {
         defer i += 1;
+
         try testing.expect(i < expected.len);
         try testing.expectEqualStrings(expected[i].match, m.string(source));
         try testing.expect(m.capture != null);
@@ -3619,14 +3583,20 @@ test "replace iteratively" {
     const source = "aa aaaa aaaaa aa aabc a x";
     const expected = "[aa] [aaaa] [aaaaa] [aa] [aa]bc [a] x";
 
-    var replacer = try re.replaceIteratively(allocator, source);
+    var thread_pool: std.Thread.Pool = undefined;
+    try thread_pool.init(.{ .allocator = allocator });
+    defer thread_pool.deinit();
+
+    var replacer = try re.replaceIterativelyWith(allocator, source, .{
+        .thread_pool = &thread_pool,
+    });
     defer replacer.deinit(allocator);
 
     while (replacer.next(allocator)) |_| {}
     replacer.reset();
 
-    while (replacer.next(allocator)) |entry| {
-        const s = entry.match.string(source);
+    while (replacer.next(allocator)) |m| {
+        const s = m.string(source);
         try replacer.write("[");
         try replacer.write(s);
         try replacer.write("]");
@@ -3642,7 +3612,7 @@ test "replace" {
     const allocator = testing.allocator;
     const re: RE = &.concat(&.{
         &.oneOrMore(&.literal("a")),
-        &.boundary,
+        &.capture(&.boundary),
     });
     const source = "aa aaaa aaaaa aa aabc a";
     const output = try re.replaceAll(allocator, source, "x");
