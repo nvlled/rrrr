@@ -140,7 +140,7 @@ const MatchState = struct {
     capture: ?*const Capture,
     input: MatchInput,
     running: *std.atomic.Value(bool),
-    thread_pool: *std.Thread.Pool,
+    thread_pool: ?*std.Thread.Pool,
 
     // Currently only used for intermediate captures,
     // particularly, for the `dupeAll()` and `connect()` methods
@@ -526,7 +526,7 @@ pub const Regex = union(enum) {
     ///
     /// Note: Avoid mixing Regex and Builder constructors
     /// in one regex tree expression, as this will make it
-    /// difficult to distinguish which  ones need to be deallocated.
+    /// difficult to distinguish which ones need to be deallocated.
     pub const Builder = struct {
         allocator: Allocator,
 
@@ -1021,33 +1021,114 @@ pub const Regex = union(enum) {
         }
 
         const rest_args = args[i + 1 ..];
-        switch (args[i].*) {
-            .repetition => {
-                var iterator: MatchIterator = .init(args[i], state);
-                defer iterator.deinit(allocator);
+        if (@import("builtin").single_threaded or state.thread_pool == null) {
+            switch (args[i].*) {
+                .alternation, .repetition => {
+                    var iterator: MatchIterator = .init(args[i], state);
+                    defer iterator.deinit(allocator);
 
-                // Spawn a thread for each repetition match.
-                // Since repetitions must match the shortest
-                // or longest possible match, the checking
-                // of matches must be done in order:
+                    while (iterator.next(allocator)) |m| {
+                        const sub_state = state.sliceInput(m.len);
+                        if (matchConcat(allocator, sub_state, rest_args)) |m2| {
+                            return .{
+                                .pos = result.pos,
+                                .len = result.len + m.len + m2.len,
+                                .capture = m2.capture,
+                            };
+                        }
+                    }
 
-                var thread_pool = state_arg.thread_pool;
-                var batch: [4]struct {
-                    wg: std.Thread.WaitGroup,
-                    result: ?MatchResult,
-                } = .{
-                    .{ .wg = .{}, .result = null },
-                    .{ .wg = .{}, .result = null },
-                    .{ .wg = .{}, .result = null },
-                    .{ .wg = .{}, .result = null },
-                };
+                    return null;
+                },
 
-                var hasMore = true;
-                var running: std.atomic.Value(bool) = .init(true);
-                var sub_result: ?MatchResult = null;
-                while (hasMore and sub_result == null) {
-                    for (0..batch.len) |j| {
-                        if (iterator.next(allocator)) |m| {
+                .captured => |re| {
+                    const m = re.match(allocator, state) orelse return null;
+
+                    const sub_state: MatchState = .{
+                        .capture = &.{
+                            .pos = m.pos,
+                            .len = m.len,
+                            .prev = if (state.capture) |c| c else null,
+                        },
+                        .input = state.input.slice(m.len),
+                        .arena = state.arena,
+                        .running = state.running,
+                        .thread_pool = state.thread_pool,
+                    };
+
+                    if (matchConcat(allocator, sub_state, rest_args)) |m2| {
+                        const arena = state.arena.allocator();
+                        return .{
+                            .pos = result.pos,
+                            .len = result.len + m.len + m2.len,
+                            .capture = blk: {
+                                const c = sub_state.capture.?;
+                                const head = c.toResult(arena);
+                                head.next = MatchResult.Capture.connect(
+                                    arena,
+                                    m.capture,
+                                    m2.capture,
+                                );
+                                break :blk head;
+                            },
+                        };
+                    }
+                },
+                else => unreachable,
+            }
+        } else {
+            switch (args[i].*) {
+                .repetition => {
+                    var iterator: MatchIterator = .init(args[i], state);
+                    defer iterator.deinit(allocator);
+
+                    // Spawn a thread for each repetition match.
+                    // Since repetitions must match the shortest
+                    // or longest possible match, the checking
+                    // of matches must be done in order.
+                    //
+                    // For example, to match with repeat(2, 8, literal("a"))
+                    // and batch size is 3:
+                    //   create thread t1 for matching aaaaaaaa with the rest of the input
+                    //   create thread t2 for matching aaaaaaa with the rest of the input
+                    //   create thread t3 for matching aaaaaa with the rest of the input
+                    //
+                    //   all threads t1, t2, t3 are (possibly) running simultaneously
+                    //
+                    //   wait and check t1 if matches
+                    //   wait and check t2 if matches
+                    //   wait and check t3 if matches
+                    //
+                    //   (next loop iteration if no match in the previous batch)
+                    //
+                    //   create thread t1 for matching aaaaa with the rest of the input
+                    //   create thread t1 for matching aaaa with the rest of the input
+                    //   create thread t1 for matching aaa with the rest of the input
+                    //
+                    //   (... and so on)
+
+                    var thread_pool = state_arg.thread_pool orelse unreachable;
+                    var batch: [4]struct {
+                        wg: std.Thread.WaitGroup,
+                        result: ?MatchResult,
+                    } = .{
+                        .{ .wg = .{}, .result = null },
+                        .{ .wg = .{}, .result = null },
+                        .{ .wg = .{}, .result = null },
+                        .{ .wg = .{}, .result = null },
+                    };
+
+                    var hasMore = true;
+                    var running: std.atomic.Value(bool) = .init(true);
+                    var sub_result: ?MatchResult = null;
+                    while (hasMore and sub_result == null) {
+                        var num_spawned: usize = 0;
+                        for (0..batch.len) |j| {
+                            const m = iterator.next(allocator) orelse {
+                                hasMore = false;
+                                break;
+                            };
+
                             var sub_state = state.sliceInput(m.len);
                             sub_state.running = &running;
 
@@ -1062,115 +1143,117 @@ pub const Regex = union(enum) {
                                     &batch[j].result,
                                 },
                             );
-                        } else hasMore = false;
-                    }
+                            num_spawned += 1;
+                        }
 
-                    for (0..batch.len) |j| {
-                        batch[j].wg.wait();
+                        for (0..num_spawned) |j| {
+                            batch[j].wg.wait();
 
-                        // NOTE: it should always wait for all the threads
-                        // to finish before returning, otherwise the thread pool
-                        // will refer to an invalidated pointers to wait groups.
-                        // What this means is:
-                        //    it should NOT break or return inside this loop
+                            // NOTE: it should always wait for all the threads
+                            // to finish before returning, otherwise the thread pool
+                            // will refer to invalidated WaitGroup pointers
+                            // What this means is:
+                            //    it should NOT break or return inside this loop,
+                            //    and it should not return inside the preceding loop
 
-                        if (sub_result == null) if (batch[j].result) |m| {
-                            running.store(false, .unordered);
-                            sub_result = .{
-                                .pos = result.pos,
-                                .len = result.len + m.len,
-                                .capture = m.capture,
+                            if (sub_result == null) if (batch[j].result) |m| {
+                                running.store(false, .unordered);
+                                sub_result = .{
+                                    .pos = result.pos,
+                                    .len = result.len + m.len,
+                                    .capture = m.capture,
+                                };
                             };
-                        };
 
-                        batch[j].wg.reset();
+                            batch[j].wg.reset();
+                        }
+
+                        if (!state_arg.running.load(.unordered)) return null;
                     }
 
-                    if (!state_arg.running.load(.unordered)) return null;
-                }
+                    return sub_result;
+                },
 
-                return sub_result;
-            },
+                .alternation => {
+                    var iterator: MatchIterator = .init(args[i], state);
+                    defer iterator.deinit(allocator);
 
-            .alternation => {
-                var iterator: MatchIterator = .init(args[i], state);
-                defer iterator.deinit(allocator);
+                    var thread_pool = state_arg.thread_pool orelse unreachable;
+                    var wg: std.Thread.WaitGroup = .{};
+                    var sub_result: ?MatchResult = null;
+                    var running: std.atomic.Value(bool) = .init(true);
 
-                var thread_pool = state_arg.thread_pool;
-                var wg: std.Thread.WaitGroup = .{};
-                var sub_result: ?MatchResult = null;
-                var running: std.atomic.Value(bool) = .init(true);
+                    while (iterator.next(allocator)) |m| {
+                        if (!state_arg.running.load(.unordered)) return null;
 
-                while (iterator.next(allocator)) |m| {
-                    if (!state_arg.running.load(.unordered)) return null;
+                        var sub_state = state.sliceInput(m.len);
+                        sub_state.running = &running;
 
-                    var sub_state = state.sliceInput(m.len);
-                    sub_state.running = &running;
+                        thread_pool.spawnWg(
+                            &wg,
+                            matchConcatWrapped,
+                            .{
+                                allocator,
+                                m,
+                                sub_state,
+                                rest_args,
+                                &sub_result,
+                            },
+                        );
 
-                    thread_pool.spawnWg(
-                        &wg,
-                        matchConcatWrapped,
-                        .{
-                            allocator,
-                            m,
-                            sub_state,
-                            rest_args,
-                            &sub_result,
-                        },
-                    );
-
-                    if (sub_result != null) {
-                        running.store(false, .unordered);
-                        break;
+                        if (sub_result != null) {
+                            running.store(false, .unordered);
+                            break;
+                        }
                     }
-                }
 
-                // NOTE: it should always wait for all the threads
-                // to finish before returning, otherwise the thread pool
-                // will refer to an invalidated pointer to the WaitGroup.
-                wg.wait();
+                    // NOTE: it should always wait for all the threads
+                    // to finish before returning, otherwise the thread pool
+                    // will refer to an invalidated pointer to the WaitGroup.
+                    wg.wait();
 
-                return if (sub_result) |m| .{
-                    .pos = result.pos,
-                    .len = result.len + m.len,
-                    .capture = m.capture,
-                } else null;
-            },
-
-            .captured => |re| {
-                const m = re.match(allocator, state) orelse return null;
-
-                const sub_state: MatchState = .{
-                    .capture = &.{
-                        .pos = m.pos,
-                        .len = m.len,
-                        .prev = if (state.capture) |c| c else null,
-                    },
-                    .input = state.input.slice(m.len),
-                    .arena = state.arena,
-                    .running = state.running,
-                    .thread_pool = state.thread_pool,
-                };
-
-                if (matchConcat(allocator, sub_state, rest_args)) |m2| {
-                    const arena = state.arena.allocator();
-                    return .{
+                    return if (sub_result) |m| .{
                         .pos = result.pos,
-                        .len = result.len + m.len + m2.len,
-                        .capture = blk: {
-                            const c = sub_state.capture.?;
-                            const head = c.toResult(arena);
-                            head.next = MatchResult.Capture.connect(
-                                arena,
-                                m.capture,
-                                m2.capture,
-                            );
-                            break :blk head;
+                        .len = result.len + m.len,
+                        .capture = m.capture,
+                    } else null;
+                },
+
+                .captured => |re| {
+                    const m = re.match(allocator, state) orelse return null;
+
+                    const sub_state: MatchState = .{
+                        .capture = &.{
+                            .pos = m.pos,
+                            .len = m.len,
+                            .prev = if (state.capture) |c| c else null,
                         },
+                        .input = state.input.slice(m.len),
+                        .arena = state.arena,
+                        .running = state.running,
+                        .thread_pool = state.thread_pool,
                     };
-                }
-            },
-            else => unreachable,
+
+                    if (matchConcat(allocator, sub_state, rest_args)) |m2| {
+                        const arena = state.arena.allocator();
+                        return .{
+                            .pos = result.pos,
+                            .len = result.len + m.len + m2.len,
+                            .capture = blk: {
+                                const c = sub_state.capture.?;
+                                const head = c.toResult(arena);
+                                head.next = MatchResult.Capture.connect(
+                                    arena,
+                                    m.capture,
+                                    m2.capture,
+                                );
+                                break :blk head;
+                            },
+                        };
+                    }
+                },
+                else => unreachable,
+            }
         }
 
         return null;
@@ -1192,23 +1275,16 @@ pub const Regex = union(enum) {
         }
     }
 
-    pub fn search(self: Self, allocator_arg: Allocator, input: []const u8) std.Thread.SpawnError!?MatchResult {
-        var ts_allocator: std.heap.ThreadSafeAllocator = .{
-            .mutex = .{},
-            .child_allocator = allocator_arg,
-        };
-        const allocator = ts_allocator.allocator();
-
+    pub fn searchWith(
+        self: Self,
+        allocator: Allocator,
+        input: []const u8,
+        options: SearchOptions,
+    ) std.Thread.SpawnError!?MatchResult {
         var pos: usize = 0;
         if (getLiteralPrefix(&self)) |prefix| {
             if (std.mem.indexOf(u8, input, prefix)) |i| pos = i;
         }
-
-        var thread_pool: std.Thread.Pool = undefined;
-        try thread_pool.init(.{
-            .allocator = allocator,
-        });
-        defer thread_pool.deinit();
 
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
@@ -1219,7 +1295,7 @@ pub const Regex = union(enum) {
             .input = .{ .value = input, .pos = pos },
             .capture = null,
             .arena = &arena,
-            .thread_pool = &thread_pool,
+            .thread_pool = options.thread_pool,
         };
 
         var result = self.match(allocator, state);
@@ -1232,33 +1308,36 @@ pub const Regex = union(enum) {
         return result;
     }
 
-    const SearchIterator = struct {
+    pub fn search(self: Self, allocator: Allocator, input: []const u8) std.Thread.SpawnError!?MatchResult {
+        return self.searchWith(allocator, input, .{});
+    }
+
+    pub const SearchOptions = struct {
+        thread_pool: ?*std.Thread.Pool = null,
+    };
+
+    pub const SearchIterator = struct {
         re: RE,
         prefix: ?[]const u8,
         state: MatchState,
-        ts_allocator: *std.heap.ThreadSafeAllocator,
 
         _last_pos: usize = 0,
         _last_len: usize = 0,
 
-        fn init(
+        pub fn reset(self: *@This()) void {
+            self.state.input.pos = 0;
+            self._last_pos = 0;
+            self._last_len = 0;
+            _ = self.state.arena.reset(.retain_capacity);
+        }
+
+        pub fn init(
             re: RE,
-            allocator_arg: Allocator,
+            allocator: Allocator,
             source: []const u8,
+            options: SearchOptions,
         ) !SearchIterator {
-            var ts_allocator = tryAlloc(allocator_arg.create(std.heap.ThreadSafeAllocator));
-            ts_allocator.* = .{
-                .mutex = .{},
-                .child_allocator = allocator_arg,
-            };
-            const allocator = ts_allocator.allocator();
-
             const running = tryAlloc(allocator.create(std.atomic.Value(bool)));
-
-            const thread_pool = tryAlloc(allocator.create(std.Thread.Pool));
-            try thread_pool.init(.{
-                .allocator = allocator,
-            });
 
             const arena = tryAlloc(allocator.create(std.heap.ArenaAllocator));
             arena.* = .init(allocator);
@@ -1274,9 +1353,8 @@ pub const Regex = union(enum) {
                     .capture = null,
                     .arena = arena,
                     .running = running,
-                    .thread_pool = thread_pool,
+                    .thread_pool = options.thread_pool,
                 },
-                .ts_allocator = ts_allocator,
             };
         }
 
@@ -1285,11 +1363,6 @@ pub const Regex = union(enum) {
 
             self.state.arena.deinit();
             allocator.destroy(self.state.arena);
-
-            self.state.thread_pool.deinit();
-            allocator.destroy(self.state.thread_pool);
-
-            allocator.destroy(self.ts_allocator);
         }
 
         // Caller should result.freeCaptures() if any capture was done
@@ -1338,7 +1411,16 @@ pub const Regex = union(enum) {
     };
 
     pub fn searchAll(self: RE, allocator: Allocator, source: []const u8) !SearchIterator {
-        return SearchIterator.init(self, allocator, source);
+        return SearchIterator.init(self, allocator, source, .{});
+    }
+
+    pub fn searchAllWith(
+        self: RE,
+        allocator: Allocator,
+        source: []const u8,
+        options: SearchOptions,
+    ) !SearchIterator {
+        return SearchIterator.init(self, allocator, source, options);
     }
 
     fn getLiteralPrefix(self: RE) ?[]const u8 {
@@ -1360,7 +1442,7 @@ pub const Regex = union(enum) {
         };
     }
 
-    const ReplaceIterator = struct {
+    pub const ReplaceIterator = struct {
         search_iterator: SearchIterator,
         output: std.Io.Writer.Allocating,
         input: []const u8,
@@ -1382,12 +1464,21 @@ pub const Regex = union(enum) {
             re: RE,
             allocator: Allocator,
             input: []const u8,
+            options: SearchOptions,
         ) !@This() {
             return .{
-                .search_iterator = try SearchIterator.init(re, allocator, input),
+                .search_iterator = try SearchIterator.init(re, allocator, input, options),
                 .input = input,
                 .output = .init(allocator),
             };
+        }
+
+        pub fn reset(self: *@This()) void {
+            self.output.clearRetainingCapacity();
+            self.search_iterator.reset();
+            self._write_offset = 0;
+            self._match_start = 0;
+            self._match_end = 0;
         }
 
         pub fn deinit(self: *@This(), allocator: Allocator) void {
@@ -1436,16 +1527,34 @@ pub const Regex = union(enum) {
     };
 
     pub fn replaceIteratively(self: RE, allocator: Allocator, input: []const u8) !ReplaceIterator {
-        return ReplaceIterator.init(self, allocator, input);
+        return ReplaceIterator.init(self, allocator, input, .{});
+    }
+
+    pub fn replaceIterativelyWith(
+        self: RE,
+        allocator: Allocator,
+        input: []const u8,
+    ) !ReplaceIterator {
+        return ReplaceIterator.init(self, allocator, input, .{});
     }
 
     fn replaceAll(
-        self: Self,
+        self: RE,
         allocator: Allocator,
         input: []const u8,
         replacement: []const u8,
     ) ![]const u8 {
-        var replacer = try self.replaceIteratively(allocator, input);
+        return self.replaceAllWith(allocator, input, replacement, .{});
+    }
+
+    fn replaceAllWith(
+        self: RE,
+        allocator: Allocator,
+        input: []const u8,
+        replacement: []const u8,
+        options: SearchOptions,
+    ) ![]const u8 {
+        var replacer = try ReplaceIterator.init(self, allocator, input, options);
         defer replacer.deinit(allocator);
 
         while (replacer.next(allocator)) |entry| {
@@ -2553,13 +2662,6 @@ test {
         expected: ?[]const u8,
     };
 
-    // TODO: once I have more tests running,
-    // I could try refactoring it using a one big nested switch-loop.
-    // Or not, this is just a toy regex implementation anyway.
-    // I have other things to do...
-    // I think the kleen star shit and backtracking is the most
-    // complicated part of the regex engine, so at least
-    // I've scratched my itch already.
     const tests: []const TestItem = &.{
         .{ .re = &.literal("a"), .input = "b", .expected = null },
         .{ .re = &.literal("b"), .input = "a", .expected = null },
@@ -2872,12 +2974,46 @@ test {
         },
     };
 
+    // test single-threaded
     for (tests) |item| {
         const allocator = testing.allocator;
         const re = item.re.normalize(allocator);
         defer re.recursiveFree(allocator);
 
         const result = try re.search(allocator, item.input);
+        defer if (result) |m| m.freeCaptures(allocator);
+
+        errdefer {
+            std.debug.print("input: {s}, expected: {s}, got: ", .{ item.input, item.expected orelse "<null>" });
+            if (result) |m| {
+                std.debug.print("{s}\n", .{m.string(item.input)});
+            } else {
+                std.debug.print("<null>\n", .{});
+            }
+            std.debug.print("re: {f}\nnormalized: {f}\n", .{ item.re, re });
+        }
+
+        if (item.expected) |expected| {
+            try testing.expect(result != null);
+            try testing.expectEqualSlices(u8, expected, result.?.string(item.input));
+        } else {
+            try testing.expect(result == null);
+        }
+    }
+
+    // test multi-threaded
+    for (tests) |item| {
+        const allocator = testing.allocator;
+        const re = item.re.normalize(allocator);
+        defer re.recursiveFree(allocator);
+
+        var thread_pool: std.Thread.Pool = undefined;
+        try thread_pool.init(.{ .allocator = allocator });
+        defer thread_pool.deinit();
+
+        const result = try re.searchWith(allocator, item.input, .{
+            .thread_pool = &thread_pool,
+        });
         defer if (result) |m| m.freeCaptures(allocator);
 
         errdefer {
@@ -3085,74 +3221,6 @@ test "alternation 2" {
 
 test "alternation 3" {
     const allocator = testing.allocator;
-    // x|(y|z)|w
-    // (aabcdex|aaaaa)|aa
-    // aa+(bcdex|aaa)
-
-    // dd+aa+(bb|cc)+(ee|ff)
-    // dd+(aabb|aacc)+(ee|ff)
-    // dd+([aabb|aacc]+ee|[aabb|aacc]+ff)
-    // dd+([aabbee|aaccee]|[aabbff|aaccff])
-    // dd+(aabbee|aaccee|abbff|aaccff) // by associativy, brackets can go poof
-    // ddaabbee|ddaaccee|ddabbff|ddaaccff
-    // what the hell, this is neat
-    // I could repeated apply distributivity
-    // then later apply normalization to get a possible prefix
-    // easier said than done though
-    // I could simplify the expression by glancing
-    // but how do I express that into a dumb algorithm
-    // at least without resorting to brute-force tree search
-    // maybe I could apply the simplification as a post-step
-    // after normalization, I think the result in the end is the same
-
-    // foo+[a-c]
-
-    // this is a theoretical case though
-    // in practice there would be a mix of literals and character sets
-    // well, characters sets are just alternations with one-length strings
-    // so it still applies
-    // what about repetition though, how would that fit into distribution
-    // I could always replace max len of repetition
-    // with the length of the string
-    // yeah that would work, sounds terrible but might actually work
-    // or I could break regex compatibility or remove things
-    // like back-references
-    // so I could achieve mathemtical nirvana
-
-    // (aa+(bcdex|aaa))|aa
-    // (aabcdex|aaaaa)|aa
-    // aha, what this means is that I could avoid
-    // doing flattening before normalization
-    // by applying the distribution above
-    // pre-flattening wouldn't work anyway
-    // if I already have the above as the argument
-
-    // (aa+(bcdex|aaa))|aa
-    // aa+bcdex|aaa|""
-
-    // in other words, concat distributes over alternation
-    // formally speaking, what kind of algebra is regex?
-    // alternation is also associative and commutative
-    // concatenation is associative only
-    // if regex is a proper algebra, I could look up
-    // a more general simplification process
-    // actually, I should just read that sipser book
-    // or not, forget looking things up,
-    // too much math gobbledygook
-    // not really as fun as figuring things out on my own
-
-    // concat(either("aa", "bb"), either("cc", "dd"))
-    // (aa|bb)+(cc|dd)
-    // ([aa+(cc|dd)]|[bb+(cc|dd)])
-    // (aacc|aadd|bbcc|bbdd)
-
-    // either(either("aabcdex", "aaaaa"), "aa")
-    // either(concat("aa", either("bcdex", "aaa")), "aa")
-
-    // either(either("aabcdex", "aaaaa"), "aa")
-    // either("aabcdex", "aaaaa", "aa")
-    // either("aabcdex", "aaaaa", "aa")
-    // concat("aa", either("bcdex", "aaa", ""))
     const re: RE = &.either(&.{
         &.either(&.{
             &.literal("aabcdex"),
@@ -3518,6 +3586,10 @@ test "match captured iterator" {
     var iterator = try re.searchAll(allocator, source);
     defer iterator.deinit(allocator);
 
+    // test if reset works
+    while (iterator.next(testing.allocator)) |_| {}
+    iterator.reset();
+
     var i: usize = 0;
     while (iterator.next(testing.allocator)) |m| {
         defer i += 1;
@@ -3549,6 +3621,9 @@ test "replace iteratively" {
 
     var replacer = try re.replaceIteratively(allocator, source);
     defer replacer.deinit(allocator);
+
+    while (replacer.next(allocator)) |_| {}
+    replacer.reset();
 
     while (replacer.next(allocator)) |entry| {
         const s = entry.match.string(source);
