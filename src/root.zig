@@ -1243,7 +1243,13 @@ pub const Regex = union(enum) {
         }
     }
 
-    pub fn searchWith(
+    /// `search` finds only first matching substring.
+    /// To search for all matches, use `searchAll`.
+    ///
+    /// If thread-pool is null, search will be done in a single-thread.
+    /// Otherwise, `allocator` must be thread-safe, by wrapping with ThreadSafeAllocator.
+    /// or by using thread-safe allocators.
+    pub fn search(
         self: Self,
         allocator: Allocator,
         input: []const u8,
@@ -1268,8 +1274,18 @@ pub const Regex = union(enum) {
         return result;
     }
 
-    pub fn search(self: Self, allocator: Allocator, input: []const u8) std.Thread.SpawnError!?MatchResult {
-        return self.searchWith(allocator, input, .{});
+    /// `searchAll` finds all matching substring.
+    ///
+    /// If thread-pool is null, search will be done in a single-thread.
+    /// Otherwise, `allocator` must be thread-safe, by wrapping with ThreadSafeAllocator.
+    /// or by using thread-safe allocators.
+    pub fn searchAll(
+        self: RE,
+        allocator: Allocator,
+        source: []const u8,
+        options: SearchOptions,
+    ) !SearchIterator {
+        return SearchIterator.init(self, allocator, source, options);
     }
 
     pub const SearchOptions = struct {
@@ -1391,38 +1407,6 @@ pub const Regex = union(enum) {
         }
     };
 
-    pub fn searchAll(self: RE, allocator: Allocator, source: []const u8) !SearchIterator {
-        return SearchIterator.init(self, allocator, source, .{});
-    }
-
-    pub fn searchAllWith(
-        self: RE,
-        allocator: Allocator,
-        source: []const u8,
-        options: SearchOptions,
-    ) !SearchIterator {
-        return SearchIterator.init(self, allocator, source, options);
-    }
-
-    fn getLiteralPrefix(self: RE) ?[]const u8 {
-        return switch (self.*) {
-            .literal_string => |val| val,
-            .concatenation => |args| {
-                // check only first arg
-                if (args.len > 0) return getLiteralPrefix(args[0]);
-                return null;
-            },
-            .captured => |re| getLiteralPrefix(re),
-            .repetition => |val| {
-                if (val.min == 0) return null;
-                if (getLiteralPrefix(val.re)) |prefix| return prefix;
-                return null;
-            },
-            .alternation => null,
-            else => null,
-        };
-    }
-
     pub const ReplaceIterator = struct {
         search_iterator: SearchIterator,
         output: std.Io.Writer.Allocating,
@@ -1492,11 +1476,10 @@ pub const Regex = union(enum) {
         }
     };
 
-    pub fn replaceIteratively(self: RE, allocator: Allocator, input: []const u8) !ReplaceIterator {
-        return ReplaceIterator.init(self, allocator, input, .{});
-    }
-
-    pub fn replaceIterativelyWith(
+    /// If thread-pool is null, search will be done in a single-thread.
+    /// Otherwise, `allocator` must be thread-safe, by wrapping with ThreadSafeAllocator.
+    /// or by using thread-safe allocators.
+    pub fn replaceIteratively(
         self: RE,
         allocator: Allocator,
         input: []const u8,
@@ -1505,16 +1488,10 @@ pub const Regex = union(enum) {
         return ReplaceIterator.init(self, allocator, input, options);
     }
 
+    /// If thread-pool is null, search will be done in a single-thread.
+    /// Otherwise, `allocator` must be thread-safe, by wrapping with ThreadSafeAllocator.
+    /// or by using thread-safe allocators.
     fn replaceAll(
-        self: RE,
-        allocator: Allocator,
-        input: []const u8,
-        replacement: []const u8,
-    ) ![]const u8 {
-        return self.replaceAllWith(allocator, input, replacement, .{});
-    }
-
-    fn replaceAllWith(
         self: RE,
         allocator: Allocator,
         input: []const u8,
@@ -1531,6 +1508,27 @@ pub const Regex = union(enum) {
         return replacer.string(allocator);
     }
 
+    fn getLiteralPrefix(self: RE) ?[]const u8 {
+        return switch (self.*) {
+            .literal_string => |val| val,
+            .concatenation => |args| {
+                // check only first arg
+                if (args.len > 0) return getLiteralPrefix(args[0]);
+                return null;
+            },
+            .captured => |re| getLiteralPrefix(re),
+            .repetition => |val| {
+                if (val.min == 0) return null;
+                if (getLiteralPrefix(val.re)) |prefix| return prefix;
+                return null;
+            },
+            .alternation => null,
+            else => null,
+        };
+    }
+
+    // Note: this is a really, really slow function, it should be
+    // done once per regex, ideally on program startup.
     inline fn normalize(re: RE, allocator: Allocator) RE {
         const result = Simplifier.normalize(re, allocator);
 
@@ -3022,7 +3020,7 @@ test {
         const re = item.re.normalize(allocator);
         defer re.recursiveFree(allocator);
 
-        const result = try re.search(allocator, item.input);
+        const result = try re.search(allocator, item.input, .{});
         defer if (result) |m| m.freeCaptures(allocator);
 
         errdefer {
@@ -3046,14 +3044,13 @@ test {
     // test multi-threaded
     for (tests) |item| {
         const allocator = testing.allocator;
-        const re = item.re.normalize(allocator);
-        defer re.recursiveFree(allocator);
+        const re = item.re;
 
         var thread_pool: std.Thread.Pool = undefined;
         try thread_pool.init(.{ .allocator = allocator });
         defer thread_pool.deinit();
 
-        const result = try re.searchWith(allocator, item.input, .{
+        const result = try re.search(allocator, item.input, .{
             .thread_pool = &thread_pool,
         });
         defer if (result) |m| m.freeCaptures(allocator);
@@ -3573,7 +3570,7 @@ test "nested captures" {
         "bc",
     };
 
-    const result = try re.search(allocator, source);
+    const result = try re.search(allocator, source, .{});
     try testing.expect(result != null);
     const m = result orelse unreachable;
     defer m.freeCaptures(allocator);
@@ -3636,7 +3633,7 @@ test "match captured iterator" {
     defer thread_pool.deinit();
 
     const source = "aabcabc   aaabcasdjfabciasofaaaabcx123";
-    var iterator = try re.searchAllWith(allocator, source, .{
+    var iterator = try re.searchAll(allocator, source, .{
         .thread_pool = &thread_pool,
     });
     defer iterator.deinit(allocator);
@@ -3687,7 +3684,7 @@ test "replace iteratively" {
     try thread_pool.init(.{ .allocator = allocator });
     defer thread_pool.deinit();
 
-    var replacer = try re.replaceIterativelyWith(allocator, source, .{
+    var replacer = try re.replaceIteratively(allocator, source, .{
         .thread_pool = &thread_pool,
     });
     defer replacer.deinit(allocator);
@@ -3721,7 +3718,7 @@ test "replace" {
         &.capture(&.boundary),
     });
     const source = "aa aaaa aaaaa aa aabc a";
-    const output = try re.replaceAll(allocator, source, "x");
+    const output = try re.replaceAll(allocator, source, "x", .{});
     defer allocator.free(output);
 
     try testing.expectEqualStrings("x x x x aabc x", output);
