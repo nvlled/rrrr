@@ -331,6 +331,7 @@ pub const Regex = union(enum) {
             .repetition = .{
                 .re = re,
                 .greedy = false,
+                .min = 0,
             },
         };
     }
@@ -1493,7 +1494,7 @@ pub const Regex = union(enum) {
     /// If thread-pool is null, search will be done in a single-thread.
     /// Otherwise, `allocator` must be thread-safe, by wrapping with ThreadSafeAllocator.
     /// or by using thread-safe allocators.
-    fn replaceAll(
+    pub fn replaceAll(
         self: RE,
         allocator: Allocator,
         input: []const u8,
