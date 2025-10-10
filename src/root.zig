@@ -223,6 +223,7 @@ const MatchInput = struct {
 
 const CharClass = struct {
     const any = BitSet.initFull();
+    const none = BitSet.initEmpty();
     const digit = fromString("0123456789");
     const alphabet = fromString("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ");
     const underscore = fromString("_");
@@ -262,6 +263,7 @@ pub const Regex = union(enum) {
     start,
     end,
     boundary,
+    @"!boundary",
 
     any,
     none,
@@ -271,7 +273,6 @@ pub const Regex = union(enum) {
     alphanum,
     whitespace,
 
-    @"!boundary",
     @"!word",
     @"!digit",
     @"!alphabet",
@@ -1531,7 +1532,15 @@ pub const Regex = union(enum) {
     }
 
     inline fn normalize(re: RE, allocator: Allocator) RE {
-        return Simplifier.normalize(re, allocator);
+        const result = Simplifier.normalize(re, allocator);
+
+        // normalize fully expands character sets to either()
+        // to make it easier to combine regexes.
+        // compressEithersToCharset() undoes any that
+        // were not combined.
+        Simplifier.compressEithersToCharset(allocator, @constCast(result));
+
+        return result;
     }
 
     pub fn format(self: RE, w: *std.io.Writer) std.io.Writer.Error!void {
@@ -1917,6 +1926,34 @@ const Simplifier = struct {
                 return Regex.literal(str).dupe(allocator);
             },
 
+            inline .word,
+            .digit,
+            .alphabet,
+            .alphanum,
+            .whitespace,
+            .@"!word",
+            .@"!digit",
+            .@"!alphabet",
+            .@"!alphanum",
+            .@"!whitespace",
+            => |_, t| {
+                const cs = switch (t) {
+                    .word => CharClass.word,
+                    .digit => CharClass.digit,
+                    .alphabet => CharClass.alphabet,
+                    .alphanum => CharClass.alphanum,
+                    .whitespace => CharClass.whitespace,
+                    .@"!word" => CharClass.word.complement(),
+                    .@"!digit" => CharClass.digit.complement(),
+                    .@"!alphabet" => CharClass.alphabet.complement(),
+                    .@"!alphanum" => CharClass.alphanum.complement(),
+                    .@"!whitespace" => CharClass.whitespace.complement(),
+                    else => unreachable,
+                };
+                const result: Regex = .{ .char_class_set = cs };
+                return normalize(&result, allocator);
+            },
+
             .char_class_set => |set| {
                 return switch (set.count()) {
                     0 => Regex.dupe(&.none, allocator),
@@ -1930,7 +1967,7 @@ const Simplifier = struct {
                     // set is small enough, convert to either()
                     // it would be a bit bigger, but also easier to
                     // combine with other regexes for simplification
-                    2...16 => |len| {
+                    else => |len| {
                         var args: ArrayList(RE) = tryAlloc(
                             ArrayList(RE).initCapacity(allocator, len),
                         );
@@ -1946,7 +1983,6 @@ const Simplifier = struct {
                         const b: Regex.Builder = .init(allocator);
                         return b.either(args.items);
                     },
-                    else => re.recursiveCopy(allocator),
                 };
             },
 
@@ -2149,6 +2185,47 @@ const Simplifier = struct {
             tryAlloc(buf.append(allocator, self.dupe(allocator)));
         }
         return tryAlloc(buf.toOwnedSlice(allocator));
+    }
+
+    fn compressEithersToCharset(allocator: Allocator, self: *Regex) void {
+        switch (self.*) {
+            .repetition => |*rep| {
+                compressEithersToCharset(allocator, @constCast(rep.re));
+            },
+            .alternation => |args| {
+                var bitset: BitSet = .initEmpty();
+                var all_chars = true;
+                for (args) |arg| {
+                    switch (arg.*) {
+                        .literal_string => |val| {
+                            if (val.len == 1) {
+                                bitset.set(val[0]);
+                            } else {
+                                all_chars = false;
+                            }
+                        },
+                        else => |*re| {
+                            compressEithersToCharset(allocator, @constCast(re));
+                            all_chars = false;
+                        },
+                    }
+                }
+                if (all_chars) {
+                    for (args) |re| re.recursiveFree(allocator);
+                    allocator.free(args);
+                    self.* = .{ .char_class_set = bitset };
+                }
+            },
+            .concatenation => |args| {
+                for (args) |re| {
+                    compressEithersToCharset(allocator, @constCast(re));
+                }
+            },
+            .captured => |re| {
+                compressEithersToCharset(allocator, @constCast(re));
+            },
+            else => {},
+        }
     }
 };
 
@@ -3648,4 +3725,28 @@ test "replace" {
     defer allocator.free(output);
 
     try testing.expectEqualStrings("x x x x aabc x", output);
+}
+
+test {
+    const re: RE = &.oneOrMore(&.either(&.{
+        &.literal("a"),
+        &.literal("b"),
+        &.literal("c"),
+        &.either(&.{
+            &.literal("x"),
+            &.digit,
+        }),
+        &.alphabet,
+        &.word,
+    }));
+
+    const actual = re.normalize(testing.allocator);
+    defer actual.recursiveFree(testing.allocator);
+
+    const expected: RE = &.concat(&.{
+        &.charset(CharClass.word),
+        &.zeroOrMore(&.charset(CharClass.word)),
+    });
+
+    try testing.expectEqualDeep(expected, actual);
 }
