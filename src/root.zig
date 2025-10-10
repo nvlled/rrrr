@@ -13,7 +13,8 @@ pub const MatchResult = struct {
     len: usize,
     capture: ?*const Capture = null,
 
-    // Resulting captures that are intended to be allocated on the heap memory.
+    // MatchResult.Capture are used for completed searches.
+    // These are intended to be allocated on the heap memory.
     //
     // (heap)
     // capture
@@ -118,8 +119,9 @@ const MatchState = struct {
     running: *std.atomic.Value(bool),
     thread_pool: ?*std.Thread.Pool,
 
-    // Temporary captures while the search is still ongoing,
-    // intended to be allocated on the stack memory.
+    // MatchState.Capture are temporary captures while
+    // the search is still ongoing. Intended to be allocated
+    // on the stack memory.
     //
     // (stack)
     // capture <-|
@@ -482,7 +484,7 @@ pub const Regex = union(enum) {
     /// except with Regex.Builder:
     ///   - the slice []const RE is copied shallowly
     ///   - all *Regex arguments are never copied
-    ///   - `Builder.literal()` also copies the string argument
+    ///   - `Builder.literal()` copies the string argument
     ///
     /// Builder.literal() copies the string because the
     /// regex is meant to be recursively free'd
@@ -1545,62 +1547,62 @@ pub const Regex = union(enum) {
         return Formatter.write(self, w, .{ .level = 0 });
     }
 
-    fn formatln(re: RE, w: *std.Io.Writer) !void {
+    pub fn formatln(re: RE, w: *std.Io.Writer) !void {
         try Formatter.write(re, w, .{ .level = 0 });
         try w.writeByte('\n');
     }
 };
 
-const Simplifier = struct {
-    // Simplification rules:
-    //
-    //   note:
-    //     * for brevity, "foo" is same a literal("foo")
-    //     * unquoted vars a, b, c, x, y, z etc. are any regex expressions
-    //     * -> means "simplifies to"
-    //
-    // - concat() -> ""
-    // - concat(x) -> x
-    // - concat(x, none, y) -> none
-    // - concat("a", "b", "c") -> "abc"
-    // - concat("a", "b", x, "c", "d") -> concat("ab", x, "cd")
-    // - concat(concat(a,b,c), concat(x,y,z)) -> concat(a, b, c, x, y, z)
-    //
-    // - either() -> none
-    // - either(none, x, y, z) -> either(x, y, z)
-    // - either(x) -> x
-    // - either(either(a,b), either(x), y) -> either(a, b, x, y)
-    // - either("fooA", "fooB", "fooC", "foo") -> concat("foo", either("A", "B", "C", ""))
-    // - either(a, a, b, b, b, c) -> either(a, b, c)
-    //
-    // - concat(either("12", "34"), either("qq", "ww"))
-    //      -> either("12qq", "12ww", "34qq", "34ww")
-    //
-    // - charset('x') -> "x"
-    // - charset() -> none
-    // - either(charset('a', 'b'), charset('c', 'd'))
-    //      -> charset('a', 'b', 'c', 'd')
-    //      -> either('a', 'b', 'c', 'd') // applies only for small charsets
-    //
-    //   note:
-    //     - zeroOrMore(x) == repeat(0, null, x)
-    //     - atEleast(n, x) == repeat(n, null, x)
-    //     - repeat(n, x) == repeat(n, n, x)
-    //
-    // - repeat(m, n, none) -> none
-    // - repeat(2, "a") -> "aa"
-    // - atLeast(2, "foo") -> concat("foofoo", zeroOrMore("foo"))
-    // - atLeast(3, x) -> concat(x, x, x, zeroOrMore(x))
-
-    // `normalize` simplifies `re` such that (1) it removes
-    // unneeded nodes (2) combines literals if possible and
-    // (3) makes it easier to get a literal prefix.
-    // This step is optional. `re` and `normalize(re)` are
-    // (or at least should be) equivalent
-    // when it comes to matching the same input strings.
-    //
-    // note: caller must recursively free the returned pointer afterwards,
-    // either manually or use re.recursiveFree(allocator)
+/// Simplification rules:
+///
+///   note:
+///     * for brevity, "foo" is same a literal("foo")
+///     * unquoted vars a, b, c, x, y, z etc. are any regex expressions
+///     * -> means "simplifies to"
+///
+/// - concat() -> ""
+/// - concat(x) -> x
+/// - concat(x, none, y) -> none
+/// - concat("a", "b", "c") -> "abc"
+/// - concat("a", "b", x, "c", "d") -> concat("ab", x, "cd")
+/// - concat(concat(a,b,c), concat(x,y,z)) -> concat(a, b, c, x, y, z)
+///
+/// - either() -> none
+/// - either(none, x, y, z) -> either(x, y, z)
+/// - either(x) -> x
+/// - either(either(a,b), either(x), y) -> either(a, b, x, y)
+/// - either("fooA", "fooB", "fooC", "foo") -> concat("foo", either("A", "B", "C", ""))
+/// - either(a, a, b, b, b, c) -> either(a, b, c)
+///
+/// - concat(either("12", "34"), either("qq", "ww"))
+///      -> either("12qq", "12ww", "34qq", "34ww")
+///
+/// - charset('x') -> "x"
+/// - charset() -> none
+/// - either(charset('a', 'b'), charset('c', 'd'))
+///      -> charset('a', 'b', 'c', 'd')
+///      -> either('a', 'b', 'c', 'd') // applies only for small charsets
+///
+///   note:
+///     - zeroOrMore(x) == repeat(0, null, x)
+///     - atEleast(n, x) == repeat(n, null, x)
+///     - repeat(n, x) == repeat(n, n, x)
+///
+/// - repeat(m, n, none) -> none
+/// - repeat(2, "a") -> "aa"
+/// - atLeast(2, "foo") -> concat("foofoo", zeroOrMore("foo"))
+/// - atLeast(3, x) -> concat(x, x, x, zeroOrMore(x))
+pub const Simplifier = struct {
+    ///
+    /// `normalize` simplifies `re` such that (1) it removes
+    /// unneeded nodes (2) combines literals if possible and
+    /// (3) makes it easier to get a literal prefix.
+    /// This step is optional. `re` and `normalize(re)` are
+    /// (or at least should be) equivalent
+    /// when it comes to matching the same input strings.
+    ///
+    /// note: caller must recursively free the returned pointer afterwards,
+    /// either manually or use re.recursiveFree(allocator)
     fn normalize(re: RE, allocator: Allocator) RE {
         switch (re.*) {
             .alternation => |args| {
