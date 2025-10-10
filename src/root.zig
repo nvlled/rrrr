@@ -1073,15 +1073,20 @@ pub const Regex = union(enum) {
                     //   (... and so on)
 
                     var thread_pool = state_arg.thread_pool orelse unreachable;
-                    var batch: [4]struct {
+
+                    const BatchEntry = struct {
                         wg: std.Thread.WaitGroup,
                         result: ?MatchResult,
-                    } = .{
-                        .{ .wg = .{}, .result = null },
-                        .{ .wg = .{}, .result = null },
-                        .{ .wg = .{}, .result = null },
-                        .{ .wg = .{}, .result = null },
                     };
+
+                    const batch_size = @min(thread_pool.threads.len, 2);
+                    var batch: []BatchEntry = tryAlloc(allocator.alloc(BatchEntry, batch_size));
+                    defer allocator.free(batch);
+
+                    for (batch) |*b| {
+                        b.wg = .{};
+                        b.result = null;
+                    }
 
                     var hasMore = true;
                     var running: std.atomic.Value(bool) = .init(true);
