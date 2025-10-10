@@ -1291,6 +1291,11 @@ pub const Regex = union(enum) {
             self._last_len = 0;
         }
 
+        pub fn setSource(self: *@This(), source: []const u8) void {
+            self.state.input = .{ .value = source, .pos = 0 };
+            self.reset();
+        }
+
         pub fn init(
             re: RE,
             allocator: Allocator,
@@ -1323,7 +1328,7 @@ pub const Regex = union(enum) {
         }
 
         // the skipped string since the last match
-        pub fn skipped(self: *@This(), source: []const u8) []const u8 {
+        pub fn skippedString(self: *@This(), source: []const u8) []const u8 {
             if (source.len == 0) return "";
             const pos = self._skipped_pos;
             return source[pos[0]..pos[1]];
@@ -1339,13 +1344,15 @@ pub const Regex = union(enum) {
             }
 
             const re = self.re;
+            const skip_start = self._last_pos + self._last_len;
 
             var input = &self.state.input;
             while (input.hasMore()) {
                 if (self.prefix) |prefix| {
                     const pos = std.mem.indexOfPos(u8, input.value, input.pos, prefix) orelse {
-                        input.pos = input.value.len; // set to end
-                        return null;
+                        const end = input.value.len;
+                        input.pos = end;
+                        break;
                     };
                     input.pos = pos;
                 }
@@ -1364,7 +1371,7 @@ pub const Regex = union(enum) {
                         // so just break and skip to the end
                         // to avoid infinite loop
                         input.pos = input.value.len;
-                        return null;
+                        break;
                     }
 
                     self._skipped_pos = .{ self._last_pos + self._last_len, m.pos };
@@ -1376,6 +1383,8 @@ pub const Regex = union(enum) {
 
                 input.pos += 1;
             }
+
+            self._skipped_pos = .{ skip_start, input.value.len };
 
             return null;
         }
@@ -1419,9 +1428,7 @@ pub const Regex = union(enum) {
         input: []const u8,
 
         _deinitialized: bool = false,
-        _write_offset: usize = 0,
-        _match_start: usize = 0,
-        _match_end: usize = 0,
+        _skipped: []const u8 = "",
 
         pub fn init(
             re: RE,
@@ -1439,9 +1446,11 @@ pub const Regex = union(enum) {
         pub fn reset(self: *@This()) void {
             self.output.clearRetainingCapacity();
             self.search_iterator.reset();
-            self._write_offset = 0;
-            self._match_start = 0;
-            self._match_end = 0;
+        }
+
+        pub fn setSource(self: *@This(), source: []const u8) void {
+            self.input = source;
+            self.search_iterator.setSource(source);
         }
 
         pub fn deinit(self: *@This(), allocator: Allocator) void {
@@ -1453,23 +1462,19 @@ pub const Regex = union(enum) {
         }
 
         pub fn next(self: *@This(), allocator: Allocator) ?MatchResult {
-            const m = self.search_iterator.next(allocator) orelse {
-                self._match_start = self.input.len;
-                return null;
-            };
-            self._match_start = m.pos;
-            self._match_end = m.pos + m.len;
+            const m = self.search_iterator.next(allocator);
+            self._skipped = self.search_iterator.skippedString(self.input);
 
             return m;
         }
 
         pub fn write(self: *@This(), str: []const u8) std.Io.Writer.Error!void {
             const w = &self.output.writer;
-            const input = self.input;
-            try w.writeAll(input[self._write_offset..self._match_start]);
+            if (self._skipped.len > 0) {
+                try w.writeAll(self._skipped);
+                self._skipped = "";
+            }
             try w.writeAll(str);
-            self._write_offset = self._match_end;
-            self._match_start = self._match_end;
         }
 
         pub fn string(self: *@This(), allocator: Allocator) error{
@@ -1477,11 +1482,10 @@ pub const Regex = union(enum) {
             OutOfMemory,
         }![]const u8 {
             defer self.deinit(allocator);
-            const input = self.input;
             const w = &self.output.writer;
 
             // if iteration was break'ed mid-way, write remaining string anyways
-            try w.writeAll(input[self._write_offset..]);
+            try w.writeAll(self._skipped);
 
             return self.output.toOwnedSlice();
         }
@@ -3512,27 +3516,33 @@ test "nested captures" {
 test "match captured iterator" {
     const allocator = testing.allocator;
     const Expected = struct {
+        skipped: []const u8,
         match: []const u8,
         captures: []const []const u8,
     };
     const expected: []const Expected = &.{
         .{
+            .skipped = "",
             .match = "aabc",
             .captures = &.{ "aa", "bc" },
         },
         .{
+            .skipped = "",
             .match = "abc",
             .captures = &.{ "a", "bc" },
         },
         .{
+            .skipped = "   ",
             .match = "aaabc",
             .captures = &.{ "aaa", "bc" },
         },
         .{
+            .skipped = "asdjf",
             .match = "abc",
             .captures = &.{ "a", "bc" },
         },
         .{
+            .skipped = "iasof",
             .match = "aaaabc",
             .captures = &.{ "aaaa", "bc" },
         },
@@ -3548,7 +3558,7 @@ test "match captured iterator" {
     try thread_pool.init(.{ .allocator = allocator });
     defer thread_pool.deinit();
 
-    const source = "aabcabc   aaabcasdjfabciasofaaaabca";
+    const source = "aabcabc   aaabcasdjfabciasofaaaabcx123";
     var iterator = try re.searchAllWith(allocator, source, .{
         .thread_pool = &thread_pool,
     });
@@ -3558,12 +3568,19 @@ test "match captured iterator" {
     while (iterator.next(allocator)) |_| {}
     iterator.reset();
 
+    // test if reset and setSource works
+    iterator.setSource("");
+    while (iterator.next(allocator)) |_| {}
+    iterator.reset();
+
+    iterator.setSource(source);
     var i: usize = 0;
     while (iterator.next(testing.allocator)) |m| {
         defer i += 1;
 
         try testing.expect(i < expected.len);
         try testing.expectEqualStrings(expected[i].match, m.string(source));
+        try testing.expectEqualStrings(expected[i].skipped, iterator.skippedString(source));
         try testing.expect(m.capture != null);
 
         const captures = m.capture orelse unreachable;
@@ -3579,6 +3596,7 @@ test "match captured iterator" {
         }
     }
 
+    try testing.expectEqualStrings("x123", iterator.skippedString(source));
     try testing.expect(i == expected.len);
 }
 
@@ -3599,6 +3617,12 @@ test "replace iteratively" {
 
     while (replacer.next(allocator)) |_| {}
     replacer.reset();
+
+    replacer.setSource("");
+    while (replacer.next(allocator)) |_| {}
+    replacer.reset();
+
+    replacer.setSource(source);
 
     while (replacer.next(allocator)) |m| {
         const s = m.string(source);
