@@ -262,12 +262,7 @@ pub const Regex = union(enum) {
 
     literal_string: []const u8,
 
-    repetition: struct {
-        re: RE,
-        min: usize,
-        max: ?usize = null,
-        greedy: bool,
-    },
+    repetition: Repetition,
 
     alternation: []const RE,
 
@@ -297,6 +292,47 @@ pub const Regex = union(enum) {
     @"!whitespace",
 
     char_class_set: BitSet,
+
+    const Repetition = struct {
+        re: RE,
+        min: usize,
+        max: ?usize = null,
+        greedy: bool,
+
+        fn check(self: @This()) void {
+            if (@import("builtin").mode != .Debug) return;
+
+            switch (self.re.*) {
+                .captured => @panic(
+                    \\cannot capture inside repetition,
+                    \\wrap the repetition with capture instead
+                ),
+                .repetition => @panic(
+                    \\cannot nest repetition, use repeat() or around() instead
+                ),
+                .alternation => @panic(
+                    \\cannot use alternation inside repetition,
+                    \\do instead: wrap repetition inside alternation
+                ),
+                .concatenation => |args| {
+                    for (args) |re2| {
+                        switch (re2.*) {
+                            .captured,
+                            .repetition,
+                            .alternation,
+                            .concatenation,
+                            => @panic(
+                                \\cannot use composite regexes inside repeat(concat(...))
+                                \\use only literals, character sets, or backref
+                            ),
+                            else => {},
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+    };
 
     // Note: constructor functions like zeroOrMore
     // takes a pointer and return a value so
@@ -486,8 +522,8 @@ pub const Regex = union(enum) {
         return .{ .back_reference = index };
     }
 
-    pub fn concat(contents: []const RE) Self {
-        return .{ .concatenation = contents };
+    pub fn concat(args: []const RE) Self {
+        return .{ .concatenation = args };
     }
 
     pub fn capture(re: RE) Self {
@@ -982,6 +1018,14 @@ pub const Regex = union(enum) {
 
         loop: while (i < args.len) : (i += 1) {
             const re = args[i];
+
+            if (@import("builtin").mode == .Debug) {
+                switch (re.*) {
+                    .concatenation => @panic("cannot nest concatenation"),
+                    else => {},
+                }
+            }
+
             var current_cap: ?*MatchResult.Capture = null;
             switch (re.*) {
                 .repetition, .alternation, .captured => break :loop,
@@ -1008,7 +1052,16 @@ pub const Regex = union(enum) {
 
         const rest_args = args[i + 1 ..];
         if (@import("builtin").single_threaded or state.thread_pool == null) {
-            switch (args[i].*) {
+            const re = args[i].*;
+
+            if (@import("builtin").mode == .Debug) {
+                switch (re) {
+                    .repetition => |val| Repetition.check(val),
+                    else => {},
+                }
+            }
+
+            switch (re) {
                 .alternation, .repetition => {
                     var iterator: MatchIterator = .init(args[i], state);
                     defer iterator.deinit(allocator);
@@ -3261,22 +3314,9 @@ test "repetition 2" {
     try testing.expect(re.equals(actual));
 }
 
-test "repetition 3" {
-    const allocator = testing.allocator;
-    const re: RE = &.around(0, 3, &.around(0, 7, &.any));
-
-    const actual = re.normalize(allocator);
-    defer actual.recursiveFree(allocator);
-
-    const expected: RE = &.around(0, 3 * 7, &.any);
-
-    try testing.expectEqualDeep(expected, actual);
-    try testing.expect(expected.equals(actual));
-}
-
 test "repetition of empty literal" {
     const allocator = testing.allocator;
-    const re: RE = &.zeroOrMore(&.oneOrMore(&.literal("")));
+    const re: RE = &.zeroOrMore(&.literal(""));
 
     const actual = re.normalize(allocator);
     defer actual.recursiveFree(allocator);
@@ -3551,21 +3591,20 @@ test "format" {
         1,
         5,
         &.concat(&.{
-            &.capture(&.literal("aaa")),
+            &.literal("aaa"),
             &.backref(1),
             &.literal("bbb"),
-            &.either(&.{
-                &.literal("ccc"),
-                &.literal("eee"),
-            }),
+            &.literal("ccc"),
+            &.literal("eee"),
         }),
     ).formatln(w);
     try t.expectEqualStrings(
         \\rep[1..5]?(cat(
-        \\  cap("aaa"),
+        \\  "aaa",
         \\  ref(1),
         \\  "bbb",
-        \\  alt("ccc", "eee"),
+        \\  "ccc",
+        \\  "eee",
         \\))
         \\
     ,
@@ -3627,9 +3666,7 @@ test "nested captures" {
     const re: RE = &.capture(&.concat(&.{
         &.capture(&.literal("a")),
         &.capture(&.literal("a")),
-        &.concat(&.{
-            &.capture(&.literal("bc")),
-        }),
+        &.capture(&.literal("bc")),
     }));
 
     const source = "aabcabc   aaabcasdjfabciasofaaaabca";
@@ -3797,7 +3834,7 @@ test "replace" {
 }
 
 test {
-    const re: RE = &.oneOrMore(&.either(&.{
+    const re: RE = &.either(&.{
         &.literal("a"),
         &.literal("b"),
         &.literal("c"),
@@ -3807,15 +3844,12 @@ test {
         }),
         &.alphabet,
         &.word,
-    }));
+    });
 
     const actual = re.normalize(testing.allocator);
     defer actual.recursiveFree(testing.allocator);
 
-    const expected: RE = &.concat(&.{
-        &.charset(CharClass.word),
-        &.zeroOrMore(&.charset(CharClass.word)),
-    });
+    const expected: RE = &.charset(CharClass.word);
 
     try testing.expectEqualDeep(expected, actual);
 }
