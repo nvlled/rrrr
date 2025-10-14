@@ -111,6 +111,21 @@ pub const MatchResult = struct {
         const i = self.pos;
         return source[i .. i + self.len];
     }
+
+    pub const Iterator = struct {
+        current: ?*const Capture,
+
+        pub fn next(self: *@This()) ?*const Capture {
+            if (self.current) |cur| {
+                defer self.current = cur.next;
+                return cur;
+            } else return null;
+        }
+    };
+
+    pub fn iterateCaptures(self: @This()) Iterator {
+        return .{ .current = self.capture };
+    }
 };
 
 const MatchState = struct {
@@ -1012,35 +1027,38 @@ pub const Regex = union(enum) {
                     return null;
                 },
 
-                .captured => |re| {
-                    const m = re.match(allocator, state) orelse return null;
+                .captured => |val| {
+                    var iterator: MatchIterator = .init(val, state);
+                    defer iterator.deinit(allocator);
 
-                    const sub_state: MatchState = .{
-                        .capture = &.{
-                            .pos = m.pos,
-                            .len = m.len,
-                            .prev = if (state.capture) |c| c else null,
-                        },
-                        .input = state.input.slice(m.len),
-                        .running = state.running,
-                        .thread_pool = state.thread_pool,
-                    };
-
-                    if (matchConcat(allocator, sub_state, rest_args)) |m2| {
-                        return .{
-                            .pos = result.pos,
-                            .len = result.len + m.len + m2.len,
-                            .capture = blk: {
-                                const c = sub_state.capture.?;
-                                const head = c.toResult(allocator);
-                                head.next = MatchResult.Capture.connect(
-                                    m.capture,
-                                    m2.capture,
-                                );
-
-                                break :blk head;
+                    while (iterator.next(allocator)) |m| {
+                        const sub_state: MatchState = .{
+                            .capture = &.{
+                                .pos = m.pos,
+                                .len = m.len,
+                                .prev = if (state.capture) |c| c else null,
                             },
+                            .input = state.input.slice(m.len),
+                            .running = state.running,
+                            .thread_pool = state.thread_pool,
                         };
+
+                        if (matchConcat(allocator, sub_state, rest_args)) |m2| {
+                            return .{
+                                .pos = result.pos,
+                                .len = result.len + m.len + m2.len,
+                                .capture = blk: {
+                                    const c = sub_state.capture.?;
+                                    const head = c.toResult(allocator);
+                                    head.next = MatchResult.Capture.connect(
+                                        m.capture,
+                                        m2.capture,
+                                    );
+
+                                    break :blk head;
+                                },
+                            };
+                        }
                     }
                 },
                 else => unreachable,
@@ -1193,34 +1211,38 @@ pub const Regex = union(enum) {
                     } else null;
                 },
 
-                .captured => |re| {
-                    const m = re.match(allocator, state) orelse return null;
+                .captured => |val| {
+                    var iterator: MatchIterator = .init(val, state);
+                    defer iterator.deinit(allocator);
 
-                    const sub_state: MatchState = .{
-                        .capture = &.{
-                            .pos = m.pos,
-                            .len = m.len,
-                            .prev = if (state.capture) |c| c else null,
-                        },
-                        .input = state.input.slice(m.len),
-                        .running = state.running,
-                        .thread_pool = state.thread_pool,
-                    };
-
-                    if (matchConcat(allocator, sub_state, rest_args)) |m2| {
-                        return .{
-                            .pos = result.pos,
-                            .len = result.len + m.len + m2.len,
-                            .capture = blk: {
-                                const c = sub_state.capture.?;
-                                const head = c.toResult(allocator);
-                                head.next = MatchResult.Capture.connect(
-                                    m.capture,
-                                    m2.capture,
-                                );
-                                break :blk head;
+                    while (iterator.next(allocator)) |m| {
+                        const sub_state: MatchState = .{
+                            .capture = &.{
+                                .pos = m.pos,
+                                .len = m.len,
+                                .prev = if (state.capture) |c| c else null,
                             },
+                            .input = state.input.slice(m.len),
+                            .running = state.running,
+                            .thread_pool = state.thread_pool,
                         };
+
+                        if (matchConcat(allocator, sub_state, rest_args)) |m2| {
+                            return .{
+                                .pos = result.pos,
+                                .len = result.len + m.len + m2.len,
+                                .capture = blk: {
+                                    const c = sub_state.capture.?;
+                                    const head = c.toResult(allocator);
+                                    head.next = MatchResult.Capture.connect(
+                                        m.capture,
+                                        m2.capture,
+                                    );
+
+                                    break :blk head;
+                                },
+                            };
+                        }
                     }
                 },
                 else => unreachable,
@@ -2662,19 +2684,66 @@ const MatchIterator = union(enum) {
         choices: []const RE,
         state: MatchState,
         index: usize = 0,
+        child_iter: ?*MatchIterator = null,
+        next_state: NextState = .init,
 
-        fn deinit(_: *@This(), _: Allocator) void {}
+        fn deinit(self: *@This(), allocator: Allocator) void {
+            if (self.child_iter) |iter| {
+                iter.deinit(allocator);
+                allocator.destroy(iter);
+            }
+        }
 
         fn next(self: *@This(), allocator: Allocator) ?MatchResult {
-            while (self.index < self.choices.len) {
-                defer self.index += 1;
-                const re = self.choices[self.index];
+            return switch (self.next_state) {
+                .init => self.nextInit(allocator),
+                .loop => self.nextLoop(allocator),
+                .last, .done => self.nextDone(),
+            };
+        }
 
-                if (re.match(allocator, self.state)) |m| {
+        fn nextInit(self: *@This(), allocator: Allocator) ?MatchResult {
+            const iter = tryAlloc(allocator.create(MatchIterator));
+            self.child_iter = iter;
+
+            self.next_state = .loop;
+            while (self.index < self.choices.len) {
+                iter.* = .init(self.choices[self.index], self.state);
+
+                if (iter.next(allocator)) |m| {
                     return m;
                 }
+
+                self.index += 1;
+                iter.deinit(allocator);
             }
 
+            return self.nextDone();
+        }
+
+        fn nextLoop(self: *@This(), allocator: Allocator) ?MatchResult {
+            self.next_state = .loop;
+
+            while (true) {
+                var iter = self.child_iter orelse {
+                    return self.nextDone();
+                };
+                if (iter.next(allocator)) |m| {
+                    return m;
+                }
+
+                self.index += 1;
+                if (self.index >= self.choices.len) break;
+
+                iter.deinit(allocator);
+                iter.* = .init(self.choices[self.index], self.state);
+            }
+
+            return self.nextDone();
+        }
+
+        fn nextDone(self: *@This()) ?MatchResult {
+            self.next_state = .done;
             return null;
         }
     };
@@ -3749,4 +3818,23 @@ test {
     });
 
     try testing.expectEqualDeep(expected, actual);
+}
+
+test {
+    defer std.debug.print("--------\n", .{});
+    const tagRE: RE = &.concat(&.{
+        &.capture(
+            &.oneOrMore(&.any),
+        ),
+        &.literal(">"),
+    });
+    const source = "word>";
+
+    const result = try tagRE.search(testing.allocator, source, .{});
+    try std.testing.expect(result != null);
+    if (result) |m| {
+        defer if (m.capture) |c| c.freeAll(testing.allocator);
+        try std.testing.expect(m.capture != null);
+        try std.testing.expectEqualStrings("word", m.capture.?.string(source));
+    }
 }
