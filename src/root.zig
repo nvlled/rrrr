@@ -1200,15 +1200,20 @@ pub const Regex = union(enum) {
                             // What this means is:
                             //    it should NOT break or return inside this loop,
                             //    and it should not return inside the preceding loop
+                            //
+                            // (phew good thing I added this note because
+                            //  I totally would have added a break here now)
 
-                            if (sub_result == null) if (batch[j].result) |m| {
-                                running.store(false, .unordered);
-                                sub_result = .{
-                                    .pos = result.pos,
-                                    .len = result.len + m.len,
-                                    .capture = m.capture,
+                            if (running.load(.unordered)) {
+                                if (sub_result == null) if (batch[j].result) |m| {
+                                    running.store(false, .unordered);
+                                    sub_result = .{
+                                        .pos = result.pos,
+                                        .len = result.len + m.len,
+                                        .capture = m.capture,
+                                    };
                                 };
-                            };
+                            }
 
                             batch[j].wg.reset();
                         }
