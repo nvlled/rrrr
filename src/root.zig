@@ -1326,6 +1326,30 @@ pub const Regex = union(enum) {
         }
     }
 
+    pub fn matches(
+        self: Self,
+        allocator: Allocator,
+        input: []const u8,
+        options: SearchOptions,
+    ) std.Thread.SpawnError!bool {
+        if (try self.search(allocator, input, options)) |m| {
+            m.freeCaptures(allocator);
+            return true;
+        }
+        return false;
+    }
+
+    test matches {
+        const any_link: RE = &.concat(&.{
+            &.literal("http"),
+            &.optional(&.literal("s")),
+            &.literal("://"),
+        });
+        const allocator = std.testing.allocator;
+        try std.testing.expect(try any_link.matches(allocator, "a link http://blah.com", .{}));
+        try std.testing.expect(!try any_link.matches(allocator, "no link 4 u", .{}));
+    }
+
     /// `search` finds only first matching substring.
     /// To search for all matches, use `searchAll`.
     ///
